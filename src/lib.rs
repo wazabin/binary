@@ -159,6 +159,14 @@ pub trait BinaryFormat: Send + Sync {
         self.contains(addr)
     }
 
+    /// The `[start, end)` bounds of the mapped region containing `addr`, if
+    /// any. Used to key per-segment facts (e.g. executability propositions)
+    /// so repeated queries in one region collapse to a single entry. Defaults
+    /// to `None` for formats that do not expose their segments.
+    fn segment_bounds(&self, _addr: u64) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Return `true` only if `addr` lies in a region *known* to be writable
     /// (from the container's segment flags). Passes that fold a value out of
     /// initialized memory use this to refuse mutable memory — e.g. a GOT slot

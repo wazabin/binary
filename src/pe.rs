@@ -407,6 +407,13 @@ impl BinaryFormat for PeBinary {
             .collect()
     }
 
+    fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
+        self.sections
+            .iter()
+            .find(|section| section.contains(addr))
+            .map(|section| (section.start, section.end()))
+    }
+
     fn symbol_name(&self, addr: u64) -> Option<&str> {
         self.analysis
             .known_functions

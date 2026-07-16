@@ -473,6 +473,13 @@ impl BinaryFormat for ElfBinary {
             .any(|segment| segment.executable && segment.contains(addr))
     }
 
+    fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
+        self.segments
+            .iter()
+            .find(|segment| segment.contains(addr))
+            .map(|segment| (segment.start, segment.end()))
+    }
+
     fn is_known_writable(&self, addr: u64) -> bool {
         self.segments
             .iter()

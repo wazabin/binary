@@ -54,6 +54,15 @@ impl BinaryFormat for Blob {
         self.data.get(offset..)
     }
 
+    fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
+        self.contains(addr).then(|| {
+            (
+                self.load_address,
+                self.load_address + self.data.len() as u64,
+            )
+        })
+    }
+
     /// A blob is one region; treat it as executable (raw code/data) so resolved
     /// jump targets in it are not filtered out.
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
