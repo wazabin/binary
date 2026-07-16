@@ -1,0 +1,12 @@
+[package]
+name = "binfmt"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Binary container formats (ELF/PE/blob) and the BinaryFormat trait, a leaf below qcode"
+repository.workspace = true
+
+[dependencies]
+elf.workspace = true
+goblin.workspace = true
+serde.workspace = true
