@@ -20,6 +20,10 @@ pub struct FunctionSymbol {
     pub name: Option<String>,
     /// Whether this is an external (imported) function stub (e.g. a PLT thunk).
     pub is_external: bool,
+    /// For an external stub, the shared library its symbol-version requirement
+    /// (`.gnu.version_r`) names, e.g. `libc.so.6`. `None` for unversioned
+    /// imports (the format does not tie those to a specific `DT_NEEDED` entry).
+    pub library: Option<String>,
 }
 
 /// A resolver slot for an imported function.
@@ -29,6 +33,9 @@ pub struct ImportSymbol {
     pub address: u64,
     /// Imported function name.
     pub name: String,
+    /// The shared library the symbol's version requirement (`.gnu.version_r`)
+    /// names, e.g. `libc.so.6`. `None` for unversioned imports.
+    pub library: Option<String>,
 }
 
 /// Results of the ELF analysis passes.
@@ -248,6 +255,7 @@ fn collect_func_symbols(
                     address: sym.st_value,
                     name,
                     is_external: false,
+                    library: None,
                 });
             }
         }
@@ -262,6 +270,7 @@ fn collect_func_symbols(
                     address: sym.st_value,
                     name,
                     is_external: false,
+                    library: None,
                 });
             }
         }
@@ -303,10 +312,20 @@ fn collect_plt_symbols_inner(
     let plt_sec_start = section_addr(".plt.sec");
 
     let (dynsymtab, dynstrtab) = elf.dynamic_symbol_table().ok().flatten()?;
+    // Symbol-version table (`.gnu.version` / `.gnu.version_r`): maps a dynsym
+    // index to the shared library its version requirement names. Absent in
+    // unversioned binaries, in which case imports carry no library.
+    let version_table = elf.symbol_version_table().ok().flatten();
+    let import_library = |sym_idx: u32| {
+        version_table
+            .as_ref()
+            .and_then(|vt| vt.get_requirement(sym_idx as usize).ok().flatten())
+            .map(|req| req.file.to_string())
+    };
 
     // Import relocations from `.rela.plt` (x86-64 / RELA) or `.rel.plt`
-    // (x86-32 / REL), as `(index, symbol_name)` pairs in section order.
-    let mut import_relocs: Vec<(usize, Option<String>)> = Vec::new();
+    // (x86-32 / REL), as `(index, symbol_name, library)` tuples in section order.
+    let mut import_relocs: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
     if let Some(rela_plt_shdr) = shdrs
         .iter()
         .find(|s| shstrtab.get(s.sh_name as usize).ok() == Some(".rela.plt"))
@@ -314,7 +333,7 @@ fn collect_plt_symbols_inner(
         for (i, rela) in elf.section_data_as_relas(&rela_plt_shdr).ok()?.enumerate() {
             if is_import_relocation(elf.ehdr.e_machine, rela.r_type) {
                 let name = dyn_symbol_name(&dynsymtab, &dynstrtab, rela.r_sym).map(str::to_string);
-                import_relocs.push((i, name));
+                import_relocs.push((i, name, import_library(rela.r_sym)));
             }
         }
     } else if let Some(rel_plt_shdr) = shdrs
@@ -324,12 +343,12 @@ fn collect_plt_symbols_inner(
         for (i, rel) in elf.section_data_as_rels(&rel_plt_shdr).ok()?.enumerate() {
             if is_import_relocation(elf.ehdr.e_machine, rel.r_type) {
                 let name = dyn_symbol_name(&dynsymtab, &dynstrtab, rel.r_sym).map(str::to_string);
-                import_relocs.push((i, name));
+                import_relocs.push((i, name, import_library(rel.r_sym)));
             }
         }
     }
 
-    for (i, name) in import_relocs {
+    for (i, name, library) in import_relocs {
         // `.plt` stub for relocation `i` sits after the reserved entry 0.
         let plt_stub_addr = plt_start + ((i + 1) as u64) * plt_entry_size;
         match plt_sec_start {
@@ -342,17 +361,20 @@ fn collect_plt_symbols_inner(
                     address: sec_start + (i as u64) * plt_entry_size,
                     name,
                     is_external: true,
+                    library: library.clone(),
                 });
                 out.push(FunctionSymbol {
                     address: plt_stub_addr,
                     name: None,
                     is_external: true,
+                    library,
                 });
             }
             None => out.push(FunctionSymbol {
                 address: plt_stub_addr,
                 name,
                 is_external: true,
+                library,
             }),
         }
     }
@@ -398,6 +420,13 @@ fn collect_import_symbols_inner(
     };
 
     let (dynsymtab, dynstrtab) = elf.dynamic_symbol_table().ok().flatten()?;
+    let version_table = elf.symbol_version_table().ok().flatten();
+    let import_library = |sym_idx: u32| {
+        version_table
+            .as_ref()
+            .and_then(|vt| vt.get_requirement(sym_idx as usize).ok().flatten())
+            .map(|req| req.file.to_string())
+    };
 
     for shdr in shdrs.iter() {
         match shdr.sh_type {
@@ -412,6 +441,7 @@ fn collect_import_symbols_inner(
                     out.push(ImportSymbol {
                         address: rela.r_offset,
                         name,
+                        library: import_library(rela.r_sym),
                     });
                 }
             }
@@ -426,6 +456,7 @@ fn collect_import_symbols_inner(
                     out.push(ImportSymbol {
                         address: rel.r_offset,
                         name,
+                        library: import_library(rel.r_sym),
                     });
                 }
             }
@@ -530,6 +561,23 @@ impl BinaryFormat for ElfBinary {
             .iter()
             .find(|f| f.address == addr)
             .map(|f| f.name.as_str())
+    }
+
+    fn import_library(&self, addr: u64) -> Option<&str> {
+        // Externals are minted either at a PLT stub's address or (for GOT-
+        // indirect calls with no PLT stub) at the relocation slot itself.
+        self.analysis
+            .known_functions
+            .iter()
+            .find(|f| f.address == addr)
+            .and_then(|f| f.library.as_deref())
+            .or_else(|| {
+                self.analysis
+                    .imported_symbols
+                    .iter()
+                    .find(|f| f.address == addr)
+                    .and_then(|f| f.library.as_deref())
+            })
     }
 
     /// Entry points are the ELF entrypoint plus all known function starts.

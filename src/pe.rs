@@ -19,6 +19,8 @@ pub struct PeFunctionSymbol {
     pub name: Option<String>,
     /// Whether this is an external imported function.
     pub is_external: bool,
+    /// For an import thunk, the DLL the import comes from.
+    pub library: Option<String>,
 }
 
 /// A PE import resolved from the import address table.
@@ -221,6 +223,7 @@ fn collect_exception_function_symbols(
             address,
             name: None,
             is_external: false,
+            library: None,
         });
     }
 }
@@ -247,6 +250,7 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
             address,
             name: Some(name),
             is_external: false,
+            library: None,
         });
     }
 }
@@ -301,6 +305,7 @@ fn mark_import_thunks(
 
         function.name = Some(import.name.clone());
         function.is_external = true;
+        function.library = Some(import.dll.clone());
     }
 }
 
@@ -464,6 +469,20 @@ impl BinaryFormat for PeBinary {
     fn import_symbol_name(&self, addr: u64) -> Option<&str> {
         self.import_at_iat(addr).map(|import| import.name.as_str())
     }
+
+    fn import_library(&self, addr: u64) -> Option<&str> {
+        // Externals are minted either at an import thunk's address or (for
+        // direct `call [iat]` sites with no thunk) at the IAT slot itself.
+        self.import_at_iat(addr)
+            .map(|import| import.dll.as_str())
+            .or_else(|| {
+                self.analysis
+                    .known_functions
+                    .iter()
+                    .find(|f| f.address == addr)
+                    .and_then(|f| f.library.as_deref())
+            })
+    }
 }
 
 fn is_primary_pe_function_name(name: &str) -> bool {
@@ -520,6 +539,7 @@ mod tests {
                     address: 0x402000,
                     name: Some("main".to_string()),
                     is_external: false,
+                    library: None,
                 }],
                 imports: vec![],
             },

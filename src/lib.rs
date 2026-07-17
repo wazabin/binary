@@ -101,6 +101,14 @@ pub trait BinaryFormat: Send + Sync {
         false
     }
 
+    /// Return the name of the library providing the external function stub at
+    /// `addr`: the PE import-directory DLL, or the ELF `.gnu.version_r` soname
+    /// the symbol's version requirement points at. `None` when the format does
+    /// not record a per-symbol source library (e.g. an unversioned ELF import).
+    fn import_library(&self, _addr: u64) -> Option<&str> {
+        None
+    }
+
     /// Return the imported symbol whose resolver slot lives at `addr`, if any.
     ///
     /// ELF uses this for GOT / PLT relocation slots such as `R_X86_64_GLOB_DAT`
