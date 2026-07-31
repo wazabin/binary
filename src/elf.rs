@@ -517,6 +517,14 @@ impl BinaryFormat for ElfBinary {
             .any(|segment| segment.writable && segment.contains(addr))
     }
 
+    /// ELF program headers carry `PF_W`, so a mapped segment without it is
+    /// proven read-only for the lifetime of the process.
+    fn is_known_read_only(&self, addr: u64) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| !segment.writable && segment.contains(addr))
+    }
+
     fn linked_libraries(&self) -> Vec<String> {
         self.needed_libraries.clone()
     }

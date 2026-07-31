@@ -54,7 +54,15 @@ pub struct PeSection {
     pub start: u64,
     pub mem_size: u64,
     pub data: Vec<u8>,
+    /// `IMAGE_SCN_MEM_WRITE` from the section characteristics. Unlike
+    /// executability (which the loader deliberately leaves permissive, see
+    /// [`BinaryFormat::mapped_regions`]), writability is read straight from the
+    /// section table, so a section without the bit is proven read-only.
+    pub writable: bool,
 }
+
+/// `IMAGE_SCN_MEM_WRITE`: the section is writable at run time.
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 impl PeSection {
     fn end(&self) -> u64 {
@@ -144,6 +152,7 @@ impl PeBinary {
                     start,
                     mem_size,
                     data,
+                    writable: section.characteristics & IMAGE_SCN_MEM_WRITE != 0,
                 }
             })
             .filter(|s| s.mem_size > 0)
@@ -402,14 +411,24 @@ impl BinaryFormat for PeBinary {
             .map(|sec| {
                 let mut bytes = sec.data.clone();
                 bytes.resize(sec.mem_size as usize, 0);
-                // `PeSection` does not record per-section permissions; mark
-                // every mapped section executable so resolved jump targets are
-                // not filtered out (the flag is only a permissive sanity check),
-                // and non-writable so the constant-read guard keeps today's
-                // behavior (PE imports are resolved via the IAT, not here).
-                (sec.start, bytes, true, false)
+                // Mark every mapped section executable so resolved jump targets
+                // are not filtered out (the flag is only a permissive sanity
+                // check). Writability is the real `IMAGE_SCN_MEM_WRITE` bit, so
+                // a snapshot built from these regions can tell `.rdata` from
+                // `.data` exactly as the live binary does.
+                (sec.start, bytes, true, sec.writable)
             })
             .collect()
+    }
+
+    /// A mapped section without `IMAGE_SCN_MEM_WRITE` is proven read-only.
+    /// (There is deliberately no `is_known_writable` override: flipping that
+    /// predicate would change which constants the folding passes trust, which is
+    /// a separate question from proving a region immutable.)
+    fn is_known_read_only(&self, addr: u64) -> bool {
+        self.sections
+            .iter()
+            .any(|section| !section.writable && section.contains(addr))
     }
 
     fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {

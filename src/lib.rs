@@ -184,6 +184,22 @@ pub trait BinaryFormat: Send + Sync {
         false
     }
 
+    /// Return `true` only if `addr` lies in a region *proven* read-only (mapped,
+    /// and the container's own permission data says the region is not writable).
+    ///
+    /// This is **not** the negation of [`is_known_writable`]: a format that
+    /// records no permissions answers `false` to both, which reads as "unknown"
+    /// rather than "read-only". Consumers that reconstruct a *value* out of
+    /// initialized memory — the decompiler rendering a `.rodata` string constant
+    /// as a named object — need the positive proof, because a writable byte may
+    /// be a different byte at run time.
+    ///
+    /// Defaults to `false` ("not proven read-only"); `Blob` and `PeBinary` keep
+    /// the default, the latter because it does not parse section permissions.
+    fn is_known_read_only(&self, _addr: u64) -> bool {
+        false
+    }
+
     /// Read `n` bytes at virtual address `addr`.
     ///
     /// Returns `None` if any byte in the requested range is unmapped.
