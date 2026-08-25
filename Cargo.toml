@@ -1,10 +1,30 @@
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/wazabin/binary"
+
+[workspace.dependencies]
+elf = "0.8"
+goblin = "0.10"
+serde = { version = "1", features = ["derive"] }
+
 [package]
-name = "binfmt"
+name = "wazabin-binary"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Binary container formats (ELF/PE/blob) and the BinaryFormat trait, a leaf below qcode"
+description = "Binary container formats and architecture metadata for binary analysis"
+readme = "README.md"
 repository.workspace = true
+homepage = "https://github.com/wazabin/binary"
+documentation = "https://docs.rs/wazabin-binary"
+keywords = ["binary", "elf", "pe", "reverse-engineering"]
+categories = ["development-tools::debugging", "parser-implementations"]
 
 [dependencies]
 elf.workspace = true

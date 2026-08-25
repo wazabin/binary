@@ -1,5 +1,5 @@
 //! The ELF/PE machine architecture enum, shared by the container parsers.
-//! Moved here from harbinger so `binfmt` stays a leaf below `qcode`.
+//! Moved here from harbinger so `wazabin_binary` stays a leaf below `qcode`.
 
 use std::fmt;
 
