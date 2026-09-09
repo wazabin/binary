@@ -1,0 +1,44 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Verify tag matches package version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == "wazabin-binary"))')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Publish wazabin-binary
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          if output="$(cargo publish 2>&1)"; then
+            echo "$output"
+            exit 0
+          fi
+
+          echo "$output"
+          # Permit a manual re-run after this version has already uploaded.
+          grep -q 'crate version .* is already uploaded' <<<"$output"
