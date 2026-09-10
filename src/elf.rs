@@ -1,8 +1,9 @@
 use elf::{
     ElfBytes,
     abi::{
-        DT_NEEDED, EM_386, EM_X86_64, PF_W, PF_X, PT_LOAD, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
-        SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SYMTAB, STT_FUNC,
+        DT_NEEDED, EM_386, EM_X86_64, ET_CORE, ET_DYN, ET_EXEC, ET_REL, PF_W, PF_X, PT_LOAD,
+        PT_PHDR, PT_TLS, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, SHT_DYNSYM, SHT_REL, SHT_RELA,
+        SHT_SYMTAB, STT_FUNC,
     },
     endian::AnyEndian,
 };
@@ -58,6 +59,69 @@ pub struct LoadSegment {
     pub executable: bool,
     /// Whether the segment is writable (`PF_W` set in `p_flags`).
     pub writable: bool,
+    /// The segment's alignment (`p_align`); zero or one means none.
+    pub align: u64,
+}
+
+/// The file type from `e_type`: what kind of object this is, and so whether
+/// a loader may place it where it likes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfKind {
+    /// `ET_EXEC`: linked to run at its segments' addresses.
+    Executable,
+    /// `ET_DYN`: a shared object or a position-independent executable; the
+    /// loader chooses the base and adds it to every address.
+    SharedObject,
+    /// `ET_REL`: an unlinked object file.
+    Relocatable,
+    /// `ET_CORE`: a core dump.
+    Core,
+    /// Anything else, with the raw `e_type`.
+    Other(u16),
+}
+
+impl ElfKind {
+    fn from_e_type(value: u16) -> Self {
+        match value {
+            ET_EXEC => ElfKind::Executable,
+            ET_DYN => ElfKind::SharedObject,
+            ET_REL => ElfKind::Relocatable,
+            ET_CORE => ElfKind::Core,
+            other => ElfKind::Other(other),
+        }
+    }
+}
+
+/// Where the program header table is, in the file and, when a segment
+/// covers it, in memory. A loader passes the virtual address to the program
+/// as `AT_PHDR`; libc startup and the dynamic linker walk the table from
+/// there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramHeaderTable {
+    /// `e_phoff`.
+    pub offset: u64,
+    /// `e_phentsize`.
+    pub entry_size: u16,
+    /// `e_phnum`.
+    pub count: u16,
+    /// The table's unrelocated virtual address: what `PT_PHDR` names, else
+    /// the address inside the `PT_LOAD` segment whose file bytes cover
+    /// `offset`. `None` when no segment maps it.
+    pub vaddr: Option<u64>,
+}
+
+/// The `PT_TLS` segment: the thread-local storage template a runtime copies
+/// for each thread. At most one per file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsSegment {
+    /// Unrelocated virtual address of the template.
+    pub vaddr: u64,
+    /// Bytes of the template that come from the file (`.tdata`).
+    pub file_size: u64,
+    /// Total size, the tail being zero-filled (`.tbss`).
+    pub mem_size: u64,
+    /// `p_align`.
+    pub align: u64,
 }
 
 impl LoadSegment {
@@ -108,6 +172,12 @@ pub struct ElfBinary {
     /// Shared-library sonames from the `.dynamic` section's `DT_NEEDED` entries,
     /// in link order (e.g. `libc.so.6`).
     pub needed_libraries: Vec<String>,
+    /// The file type.
+    pub kind: ElfKind,
+    /// The program header table's location.
+    pub program_headers: ProgramHeaderTable,
+    /// The thread-local storage template, if the file has one.
+    pub tls: Option<TlsSegment>,
 }
 
 /// Errors that can occur while parsing an ELF binary.
@@ -167,6 +237,7 @@ impl ElfBinary {
                     data,
                     executable: p.p_flags & PF_X != 0,
                     writable: p.p_flags & PF_W != 0,
+                    align: p.p_align,
                 }
             })
             .collect();
@@ -195,6 +266,36 @@ impl ElfBinary {
         // --- Analysis pass 5: DT_NEEDED shared-library sonames -----------------
         let needed_libraries = collect_needed_libraries(&elf);
 
+        // --- What a loader needs beyond the segments ---------------------------
+        let kind = ElfKind::from_e_type(elf.ehdr.e_type);
+        let phoff = elf.ehdr.e_phoff;
+        let phdr_vaddr = segments
+            .iter()
+            .find(|p| p.p_type == PT_PHDR)
+            .map(|p| p.p_vaddr)
+            .or_else(|| {
+                segments
+                    .iter()
+                    .filter(|p| p.p_type == PT_LOAD)
+                    .find(|p| phoff >= p.p_offset && phoff < p.p_offset + p.p_filesz)
+                    .map(|p| p.p_vaddr + (phoff - p.p_offset))
+            });
+        let program_headers = ProgramHeaderTable {
+            offset: phoff,
+            entry_size: elf.ehdr.e_phentsize,
+            count: elf.ehdr.e_phnum,
+            vaddr: phdr_vaddr,
+        };
+        let tls = segments
+            .iter()
+            .find(|p| p.p_type == PT_TLS)
+            .map(|p| TlsSegment {
+                vaddr: p.p_vaddr,
+                file_size: p.p_filesz,
+                mem_size: p.p_memsz,
+                align: p.p_align,
+            });
+
         // Deduplicate by address (symtab may overlap dynsym).
         known_functions.sort_by_key(|f| f.address);
         known_functions.dedup_by_key(|f| f.address);
@@ -211,6 +312,9 @@ impl ElfBinary {
             },
             architecture: from_elf_machine(elf.ehdr.e_machine).ok_or(ElfError::UnknownArch)?,
             needed_libraries,
+            kind,
+            program_headers,
+            tls,
         })
     }
 }
