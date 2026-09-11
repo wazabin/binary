@@ -162,7 +162,8 @@ impl LoadSegment {
 /// time:
 /// - **Entrypoint**: `e_entry` from the ELF header.
 /// - **Known functions**: all `STT_FUNC` symbols found in `.symtab` or
-///   `.dynsym`.
+///   `.dynsym`, PLT stubs, and every `.eh_frame` FDE start (nameless, but
+///   they survive `strip`).
 #[derive(Debug, Clone)]
 pub struct ElfBinary {
     pub load_address: u64,
@@ -266,6 +267,46 @@ impl ElfBinary {
         // --- Analysis pass 5: DT_NEEDED shared-library sonames -----------------
         let needed_libraries = collect_needed_libraries(&elf);
 
+        // --- Analysis pass 6: `.eh_frame` FDE starts ---------------------------
+        // Pushed last so a named symbol at the same address wins the dedup
+        // below. Skipped for the PLT stub tables (their FDE covers the whole
+        // table, and the stubs are already listed by name) and for anything
+        // outside executable memory (a stale FDE in a hand-edited binary).
+        let plt_ranges = plt_section_ranges(&elf);
+        for addr in crate::eh_frame::function_starts(&elf, file_bytes) {
+            let in_plt = plt_ranges.iter().any(|(s, e)| addr >= *s && addr < *e);
+            let executable = load_segments
+                .iter()
+                .any(|seg| seg.executable && seg.contains(addr));
+            if !in_plt && executable {
+                known_functions.push(FunctionSymbol {
+                    address: addr,
+                    name: None,
+                    is_external: false,
+                    library: None,
+                });
+            }
+        }
+
+        // --- Analysis pass 7: constructor / destructor entry points -----------
+        // The crt functions `frame_dummy` and `__do_global_dtors_aux` have no
+        // FDE, but the loader reaches them through `.init_array` /
+        // `.fini_array` (and `DT_INIT` / `DT_FINI`), so those pointer tables
+        // are function starts too.
+        for addr in init_fini_entries(&elf, &load_segments) {
+            let executable = load_segments
+                .iter()
+                .any(|seg| seg.executable && seg.contains(addr));
+            if executable {
+                known_functions.push(FunctionSymbol {
+                    address: addr,
+                    name: None,
+                    is_external: false,
+                    library: None,
+                });
+            }
+        }
+
         // --- What a loader needs beyond the segments ---------------------------
         let kind = ElfKind::from_e_type(elf.ehdr.e_type);
         let phoff = elf.ehdr.e_phoff;
@@ -317,6 +358,75 @@ impl ElfBinary {
             tls,
         })
     }
+}
+
+/// `[start, end)` virtual ranges of the PLT stub tables (`.plt`, `.plt.sec`,
+/// `.plt.got`), for excluding their FDEs from function discovery.
+fn plt_section_ranges(elf: &ElfBytes<AnyEndian>) -> Vec<(u64, u64)> {
+    let (shdrs, shstrtab) = match elf.section_headers_with_strtab() {
+        Ok((Some(s), Some(st))) => (s, st),
+        _ => return Vec::new(),
+    };
+    shdrs
+        .iter()
+        .filter(|s| {
+            matches!(
+                shstrtab.get(s.sh_name as usize).ok(),
+                Some(".plt" | ".plt.sec" | ".plt.got")
+            )
+        })
+        .map(|s| (s.sh_addr, s.sh_addr + s.sh_size))
+        .collect()
+}
+
+/// Function pointers stored in `.preinit_array` / `.init_array` /
+/// `.fini_array`, plus the `DT_INIT` / `DT_FINI` dynamic entries. Read from
+/// the loaded image, so a non-PIE binary yields absolute addresses and a PIE
+/// (whose slots hold `R_X86_64_RELATIVE` addends) its link-time ones.
+fn init_fini_entries(elf: &ElfBytes<AnyEndian>, segments: &[LoadSegment]) -> Vec<u64> {
+    let ptr_size = match elf.ehdr.class {
+        elf::file::Class::ELF32 => 4,
+        elf::file::Class::ELF64 => 8,
+    };
+    let read_ptr = |addr: u64| -> Option<u64> {
+        let seg = segments.iter().find(|s| s.contains(addr))?;
+        let bytes = seg.bytes_at(addr)?;
+        match ptr_size {
+            4 => Some(u64::from(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))),
+            _ => Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+        }
+    };
+    let mut out = Vec::new();
+    if let Ok((Some(shdrs), Some(shstrtab))) = elf.section_headers_with_strtab() {
+        for shdr in shdrs.iter() {
+            if !matches!(
+                shstrtab.get(shdr.sh_name as usize).ok(),
+                Some(".preinit_array" | ".init_array" | ".fini_array")
+            ) {
+                continue;
+            }
+            let mut slot = shdr.sh_addr;
+            let end = shdr.sh_addr.saturating_add(shdr.sh_size);
+            while slot + ptr_size as u64 <= end {
+                match read_ptr(slot) {
+                    // `0` and `-1` are the linker's empty / sentinel slots.
+                    Some(0) | Some(u64::MAX) | None => {}
+                    Some(target) => out.push(target),
+                }
+                slot += ptr_size as u64;
+            }
+        }
+    }
+    if let Ok(Some(dynamic)) = elf.dynamic() {
+        for entry in dynamic.iter() {
+            if (entry.d_tag == elf::abi::DT_INIT || entry.d_tag == elf::abi::DT_FINI)
+                && entry.d_ptr() != 0
+            {
+                out.push(entry.d_ptr());
+            }
+        }
+    }
+    out
 }
 
 /// Collect `DT_NEEDED` shared-library sonames from the `.dynamic` section,

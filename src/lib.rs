@@ -10,6 +10,7 @@ mod arch;
 mod target_os;
 
 pub mod blob;
+pub mod eh_frame;
 pub mod elf;
 pub mod pe;
 
