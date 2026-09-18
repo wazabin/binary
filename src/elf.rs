@@ -11,6 +11,7 @@ use elf::{
 use crate::Arch;
 
 use crate::BinaryFormat;
+use crate::symbols::SymbolIndex;
 
 /// A known function start address extracted from an ELF symbol table.
 #[derive(Debug, Clone)]
@@ -164,11 +165,19 @@ impl LoadSegment {
 /// - **Known functions**: all `STT_FUNC` symbols found in `.symtab` or
 ///   `.dynsym`, PLT stubs, and every `.eh_frame` FDE start (nameless, but
 ///   they survive `strip`).
+///
+/// `known_functions` and `imported_symbols` are sorted by address with one
+/// entry per address, and a name index is built alongside them, which is
+/// what the [`BinaryFormat::symbol_name`] / [`BinaryFormat::symbol_address`]
+/// lookups search. Both hold once parsing returns; mutating the tables
+/// afterwards is not supported.
 #[derive(Debug, Clone)]
 pub struct ElfBinary {
     pub load_address: u64,
     pub segments: Vec<LoadSegment>,
     pub analysis: ElfAnalysis,
+    /// Function names -> addresses, over `analysis.known_functions`.
+    symbols: SymbolIndex,
     pub architecture: Arch,
     /// Shared-library sonames from the `.dynamic` section's `DT_NEEDED` entries,
     /// in link order (e.g. `libc.so.6`).
@@ -337,11 +346,17 @@ impl ElfBinary {
                 align: p.p_align,
             });
 
-        // Deduplicate by address (symtab may overlap dynsym).
+        // Deduplicate by address (symtab may overlap dynsym). The sorted
+        // order is what `function_at` / `import_at` binary-search.
         known_functions.sort_by_key(|f| f.address);
         known_functions.dedup_by_key(|f| f.address);
         imported_symbols.sort_by_key(|f| f.address);
         imported_symbols.dedup_by_key(|f| f.address);
+        let symbols = SymbolIndex::build(
+            known_functions
+                .iter()
+                .map(|f| (f.name.as_deref(), f.address, f.is_external)),
+        );
 
         Ok(ElfBinary {
             load_address,
@@ -351,12 +366,29 @@ impl ElfBinary {
                 known_functions,
                 imported_symbols,
             },
+            symbols,
             architecture: from_elf_machine(elf.ehdr.e_machine).ok_or(ElfError::UnknownArch)?,
             needed_libraries,
             kind,
             program_headers,
             tls,
         })
+    }
+
+    /// The known function starting at `addr`, by binary search over the
+    /// address-sorted table.
+    fn function_at(&self, addr: u64) -> Option<&FunctionSymbol> {
+        let functions = &self.analysis.known_functions;
+        let idx = functions.binary_search_by_key(&addr, |f| f.address).ok()?;
+        Some(&functions[idx])
+    }
+
+    /// The imported symbol whose resolver slot is at `addr`, by binary search
+    /// over the address-sorted table.
+    fn import_at(&self, addr: u64) -> Option<&ImportSymbol> {
+        let imports = &self.analysis.imported_symbols;
+        let idx = imports.binary_search_by_key(&addr, |f| f.address).ok()?;
+        Some(&imports[idx])
     }
 }
 
@@ -757,10 +789,7 @@ impl BinaryFormat for ElfBinary {
     }
 
     fn symbol_name(&self, addr: u64) -> Option<&str> {
-        self.analysis
-            .known_functions
-            .iter()
-            .find(|f| f.address == addr)
+        self.function_at(addr)
             .and_then(|f| f.name.as_deref())
             .filter(|name| !name.is_empty())
             .or_else(|| {
@@ -768,38 +797,29 @@ impl BinaryFormat for ElfBinary {
             })
     }
 
+    /// The inverse of [`symbol_name`](BinaryFormat::symbol_name), including
+    /// the synthetic `_start` it gives an unnamed entrypoint.
+    fn symbol_address(&self, name: &str) -> Option<u64> {
+        self.symbols.address(name).or_else(|| {
+            let entry = self.analysis.entrypoint;
+            (name == "_start" && self.symbol_name(entry) == Some("_start")).then_some(entry)
+        })
+    }
+
     fn is_external_symbol(&self, addr: u64) -> bool {
-        self.analysis
-            .known_functions
-            .iter()
-            .find(|f| f.address == addr)
-            .map(|f| f.is_external)
-            .unwrap_or(false)
+        self.function_at(addr).is_some_and(|f| f.is_external)
     }
 
     fn import_symbol_name(&self, addr: u64) -> Option<&str> {
-        self.analysis
-            .imported_symbols
-            .iter()
-            .find(|f| f.address == addr)
-            .map(|f| f.name.as_str())
+        self.import_at(addr).map(|f| f.name.as_str())
     }
 
     fn import_library(&self, addr: u64) -> Option<&str> {
         // Externals are minted either at a PLT stub's address or (for GOT-
         // indirect calls with no PLT stub) at the relocation slot itself.
-        self.analysis
-            .known_functions
-            .iter()
-            .find(|f| f.address == addr)
+        self.function_at(addr)
             .and_then(|f| f.library.as_deref())
-            .or_else(|| {
-                self.analysis
-                    .imported_symbols
-                    .iter()
-                    .find(|f| f.address == addr)
-                    .and_then(|f| f.library.as_deref())
-            })
+            .or_else(|| self.import_at(addr).and_then(|f| f.library.as_deref()))
     }
 
     /// Entry points are the ELF entrypoint plus all known function starts.

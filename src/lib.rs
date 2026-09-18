@@ -7,6 +7,7 @@
 //! re-exports this crate as `harbinger::format` and `harbinger::arch::Arch`.
 
 mod arch;
+mod symbols;
 mod target_os;
 
 pub mod blob;
@@ -91,7 +92,40 @@ pub trait BinaryFormat: Send + Sync {
     /// Return the symbol name for the function starting at `addr`, if the
     /// binary format has one (e.g. from an ELF symbol table).
     /// Returns `None` for formats with no symbol information.
+    ///
+    /// `addr` is a link-time address, as [`load_address`] and [`entry_points`]
+    /// report them: for a position-independent executable or shared object
+    /// the loader adds a base of its choosing, so subtract that base from a
+    /// run-time address before asking. The ELF and PE implementations answer
+    /// from an index built at parse time rather than scanning their function
+    /// table, so a caller may ask per address. The inverse lookup is
+    /// [`symbol_address`].
+    ///
+    /// [`load_address`]: Self::load_address
+    /// [`entry_points`]: Self::entry_points
+    /// [`symbol_address`]: Self::symbol_address
     fn symbol_name(&self, _addr: u64) -> Option<&str> {
+        None
+    }
+
+    /// Return the address of the function symbol called `name`, if the binary
+    /// format has one (e.g. `main` from an ELF `.symtab`, or an import stub
+    /// named after the function it resolves to).
+    /// Returns `None` for formats with no symbol information.
+    ///
+    /// The address is the link-time one, as [`load_address`] and
+    /// [`entry_points`] report them: for a position-independent executable or
+    /// shared object it is relative to whatever base the loader picks, so add
+    /// that base to reach the function at run time. When several functions
+    /// share a name, a defined function is preferred over an import stub, and
+    /// otherwise the lowest address is returned. The ELF and PE
+    /// implementations answer from an index built at parse time rather than
+    /// scanning their function table. The inverse lookup is [`symbol_name`].
+    ///
+    /// [`load_address`]: Self::load_address
+    /// [`entry_points`]: Self::entry_points
+    /// [`symbol_name`]: Self::symbol_name
+    fn symbol_address(&self, _name: &str) -> Option<u64> {
         None
     }
 
