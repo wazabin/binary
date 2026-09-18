@@ -18,6 +18,131 @@ pub mod pe;
 pub use arch::Arch;
 pub use target_os::TargetOs;
 
+/// The byte order a container was parsed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
+/// A container format this crate can parse, as sniffed from a file's magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// `\x7fELF`.
+    Elf,
+    /// An `MZ` stub whose `e_lfanew` points at a `PE\0\0` signature.
+    Pe,
+}
+
+impl Format {
+    /// Sniff the container format from the start of a file, or `None` when
+    /// the bytes match neither (a raw blob, or a bare DOS `MZ` executable).
+    pub fn detect(bytes: &[u8]) -> Option<Format> {
+        if bytes.starts_with(b"\x7fELF") {
+            return Some(Format::Elf);
+        }
+        if bytes.starts_with(b"MZ") {
+            let e_lfanew = bytes.get(0x3c..0x40)?;
+            let at = u32::from_le_bytes(e_lfanew.try_into().ok()?) as usize;
+            if bytes.get(at..at + 4) == Some(b"PE\0\0") {
+                return Some(Format::Pe);
+            }
+        }
+        None
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Format::Elf => "elf",
+            Format::Pe => "pe",
+        })
+    }
+}
+
+/// Why [`load`] could not produce a binary.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The bytes are neither ELF nor PE; callers that accept raw images can
+    /// fall back to [`blob::Blob`] with a load address of their choosing.
+    UnknownFormat,
+    Elf(elf::ElfError),
+    Pe(pe::PeError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::UnknownFormat => write!(f, "not an ELF or PE file"),
+            LoadError::Elf(e) => write!(f, "failed to parse ELF: {e}"),
+            LoadError::Pe(e) => write!(f, "failed to parse PE: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoadError::UnknownFormat => None,
+            LoadError::Elf(e) => Some(e),
+            LoadError::Pe(e) => Some(e),
+        }
+    }
+}
+
+/// Detect the container format of `bytes` and parse it.
+///
+/// This is the entry point for callers that do not care which container
+/// they were handed: the result answers every [`BinaryFormat`] query. Match
+/// on [`Format::detect`] and call [`elf::ElfBinary::parse`] or
+/// [`pe::PeBinary::parse`] directly to keep the concrete type.
+pub fn load(bytes: &[u8]) -> Result<Box<dyn BinaryFormat>, LoadError> {
+    match Format::detect(bytes).ok_or(LoadError::UnknownFormat)? {
+        Format::Elf => elf::ElfBinary::parse(bytes)
+            .map(|b| Box::new(b) as Box<dyn BinaryFormat>)
+            .map_err(LoadError::Elf),
+        Format::Pe => pe::PeBinary::parse(bytes)
+            .map(|b| Box::new(b) as Box<dyn BinaryFormat>)
+            .map_err(LoadError::Pe),
+    }
+}
+
+/// A named region of the image, as the container's own layout table lists
+/// it: an ELF section header or a PE section. Returned by
+/// [`BinaryFormat::sections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// The name from the container's string table, e.g. `.text`.
+    pub name: String,
+    /// Link-time virtual address of the first byte.
+    pub address: u64,
+    /// Size in memory, zero-filled tail (`.bss`) included.
+    pub size: u64,
+    /// The container's writable flag (`SHF_WRITE`, `IMAGE_SCN_MEM_WRITE`).
+    pub writable: bool,
+    /// The container's executable flag (`SHF_EXECINSTR`,
+    /// `IMAGE_SCN_MEM_EXECUTE`).
+    pub executable: bool,
+}
+
+/// A named function symbol, as returned by [`BinaryFormat::symbols`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    /// Link-time virtual address of the function's first byte.
+    pub address: u64,
+    /// The function's size in bytes, when the container records one (ELF
+    /// `st_size`, a PE exception-directory entry). `None` when it does not,
+    /// or records zero.
+    pub size: Option<u64>,
+    /// Whether this is an import stub (PLT entry, IAT thunk) rather than a
+    /// function defined in the image.
+    pub is_external: bool,
+    /// For an import stub, the library it resolves to, when known.
+    pub library: Option<String>,
+}
+
 /// Map a byte to its printable ASCII representation.
 ///
 /// Returns `b` unchanged for bytes in the printable ASCII range (0x20–0x7e),
@@ -76,6 +201,18 @@ pub trait BinaryFormat: Send + Sync {
     /// format, or raw values from the blob.
     fn architecture(&self) -> Arch;
 
+    /// The byte order the container declares (ELF `EI_DATA`); PE is always
+    /// little-endian. Defaults to little-endian for formats that record none.
+    fn endianness(&self) -> Endian {
+        Endian::Little
+    }
+
+    /// The container's word size in bits, 32 or 64 (ELF `EI_CLASS`, PE32 vs
+    /// PE32+). Defaults to 64 for formats that record none.
+    fn bits(&self) -> u32 {
+        64
+    }
+
     /// The operating system this binary targets, inferred from the container
     /// format. Defaults to [`TargetOs::Unknown`]; PE returns Windows, ELF Linux.
     fn os(&self) -> TargetOs {
@@ -86,6 +223,24 @@ pub trait BinaryFormat: Send + Sync {
     /// PE import-directory DLL names (original case; matching is
     /// case-insensitive). Empty when the format has no such notion (Blob).
     fn linked_libraries(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The container's layout table, in address order: an ELF file's
+    /// allocated section headers, a PE file's sections. Coarser than
+    /// [`mapped_regions`] for ELF (one `PT_LOAD` holds several sections) and
+    /// finer-named. Empty for formats with no such table (Blob).
+    ///
+    /// [`mapped_regions`]: Self::mapped_regions
+    fn sections(&self) -> Vec<Section> {
+        Vec::new()
+    }
+
+    /// Every named function symbol, in address order: what
+    /// [`symbol_name`](Self::symbol_name) would answer for each address, with
+    /// the size and import provenance the container records. Empty for
+    /// formats with no symbol information.
+    fn symbols(&self) -> Vec<Symbol> {
         Vec::new()
     }
 
@@ -306,7 +461,45 @@ pub trait BinaryFormat: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryFormat, blob::Blob};
+    use super::{BinaryFormat, Endian, Format, LoadError, blob::Blob, load};
+
+    #[test]
+    fn detects_elf_by_magic() {
+        assert_eq!(Format::detect(b"\x7fELF\x02\x01\x01"), Some(Format::Elf));
+        assert_eq!(Format::detect(b"\x7fEL"), None);
+    }
+
+    #[test]
+    fn detects_pe_only_behind_a_pe_signature() {
+        let mut pe = vec![0u8; 0x80];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        assert_eq!(Format::detect(&pe), None);
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        assert_eq!(Format::detect(&pe), Some(Format::Pe));
+
+        // A bare DOS executable, or an `MZ` too short to hold `e_lfanew`.
+        assert_eq!(Format::detect(b"MZ\x90\x00"), None);
+        let mut dos = vec![0u8; 0x80];
+        dos[..2].copy_from_slice(b"MZ");
+        assert_eq!(Format::detect(&dos), None);
+    }
+
+    #[test]
+    fn detects_nothing_in_a_blob() {
+        assert_eq!(Format::detect(b""), None);
+        assert_eq!(Format::detect(&[0x55, 0x48, 0x89, 0xe5]), None);
+        assert!(matches!(load(b"\x90\x90"), Err(LoadError::UnknownFormat)));
+    }
+
+    #[test]
+    fn blob_keeps_the_trait_defaults() {
+        let blob = Blob::new(0x1000, vec![0x90]);
+        assert_eq!(blob.endianness(), Endian::Little);
+        assert_eq!(blob.bits(), 64);
+        assert!(blob.sections().is_empty());
+        assert!(blob.symbols().is_empty());
+    }
 
     #[test]
     fn read_printable_cstring_accepts_printable_ascii() {

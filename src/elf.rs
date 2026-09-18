@@ -2,15 +2,14 @@ use elf::{
     ElfBytes,
     abi::{
         DT_NEEDED, EM_386, EM_X86_64, ET_CORE, ET_DYN, ET_EXEC, ET_REL, PF_W, PF_X, PT_LOAD,
-        PT_PHDR, PT_TLS, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, SHT_DYNSYM, SHT_REL, SHT_RELA,
-        SHT_SYMTAB, STT_FUNC,
+        PT_PHDR, PT_TLS, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, SHF_ALLOC, SHF_EXECINSTR,
+        SHF_WRITE, SHT_DYNSYM, SHT_NOBITS, SHT_REL, SHT_RELA, SHT_SYMTAB, STT_FUNC,
     },
-    endian::AnyEndian,
+    endian::{AnyEndian, EndianParse},
 };
 
-use crate::Arch;
+use crate::{Arch, BinaryFormat, Endian, Section, Symbol};
 
-use crate::BinaryFormat;
 use crate::symbols::SymbolIndex;
 
 /// A known function start address extracted from an ELF symbol table.
@@ -20,6 +19,9 @@ pub struct FunctionSymbol {
     pub address: u64,
     /// Name from the string table, if present.
     pub name: Option<String>,
+    /// `st_size` when the symbol table records a non-zero one. `None` for
+    /// PLT stubs, `.eh_frame` starts, and assembly symbols with no `.size`.
+    pub size: Option<u64>,
     /// Whether this is an external (imported) function stub (e.g. a PLT thunk).
     pub is_external: bool,
     /// For an external stub, the shared library its symbol-version requirement
@@ -62,6 +64,26 @@ pub struct LoadSegment {
     pub writable: bool,
     /// The segment's alignment (`p_align`); zero or one means none.
     pub align: u64,
+}
+
+/// An allocated section header (`SHF_ALLOC` set): a named slice of the
+/// loaded image such as `.text` or `.bss`. Absent from a file whose section
+/// table was stripped, which loaders never need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElfSection {
+    /// The name from `.shstrtab`.
+    pub name: String,
+    /// `sh_addr`.
+    pub address: u64,
+    /// `sh_size`.
+    pub size: u64,
+    /// `SHF_WRITE`.
+    pub writable: bool,
+    /// `SHF_EXECINSTR`.
+    pub executable: bool,
+    /// `SHT_NOBITS`: the section occupies no file bytes and is zero-filled
+    /// by the loader (`.bss`, `.tbss`).
+    pub nobits: bool,
 }
 
 /// The file type from `e_type`: what kind of object this is, and so whether
@@ -179,6 +201,13 @@ pub struct ElfBinary {
     /// Function names -> addresses, over `analysis.known_functions`.
     symbols: SymbolIndex,
     pub architecture: Arch,
+    /// `EI_DATA`: the byte order every multi-byte field was read with.
+    pub endian: Endian,
+    /// `EI_CLASS`: `true` for ELF64, `false` for ELF32.
+    pub is_64: bool,
+    /// The allocated section headers in address order, empty when the
+    /// section table was stripped. What [`BinaryFormat::sections`] reports.
+    pub sections: Vec<ElfSection>,
     /// Shared-library sonames from the `.dynamic` section's `DT_NEEDED` entries,
     /// in link order (e.g. `libc.so.6`).
     pub needed_libraries: Vec<String>,
@@ -291,6 +320,7 @@ impl ElfBinary {
                 known_functions.push(FunctionSymbol {
                     address: addr,
                     name: None,
+                    size: None,
                     is_external: false,
                     library: None,
                 });
@@ -310,13 +340,23 @@ impl ElfBinary {
                 known_functions.push(FunctionSymbol {
                     address: addr,
                     name: None,
+                    size: None,
                     is_external: false,
                     library: None,
                 });
             }
         }
 
+        // --- The section table, for callers that want names -------------------
+        let sections = collect_sections(&elf);
+
         // --- What a loader needs beyond the segments ---------------------------
+        let endian = if elf.ehdr.endianness.is_little() {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        let is_64 = matches!(elf.ehdr.class, elf::file::Class::ELF64);
         let kind = ElfKind::from_e_type(elf.ehdr.e_type);
         let phoff = elf.ehdr.e_phoff;
         let phdr_vaddr = segments
@@ -368,6 +408,9 @@ impl ElfBinary {
             },
             symbols,
             architecture: from_elf_machine(elf.ehdr.e_machine).ok_or(ElfError::UnknownArch)?,
+            endian,
+            is_64,
+            sections,
             needed_libraries,
             kind,
             program_headers,
@@ -390,6 +433,32 @@ impl ElfBinary {
         let idx = imports.binary_search_by_key(&addr, |f| f.address).ok()?;
         Some(&imports[idx])
     }
+}
+
+/// The `SHF_ALLOC` section headers with a name, in address order. Empty when
+/// the file has no section table or no `.shstrtab`.
+fn collect_sections(elf: &ElfBytes<AnyEndian>) -> Vec<ElfSection> {
+    let (shdrs, shstrtab) = match elf.section_headers_with_strtab() {
+        Ok((Some(s), Some(st))) => (s, st),
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<ElfSection> = shdrs
+        .iter()
+        .filter(|s| s.sh_flags & u64::from(SHF_ALLOC) != 0)
+        .filter_map(|s| {
+            let name = shstrtab.get(s.sh_name as usize).ok()?;
+            Some(ElfSection {
+                name: name.to_owned(),
+                address: s.sh_addr,
+                size: s.sh_size,
+                writable: s.sh_flags & u64::from(SHF_WRITE) != 0,
+                executable: s.sh_flags & u64::from(SHF_EXECINSTR) != 0,
+                nobits: s.sh_type == SHT_NOBITS,
+            })
+        })
+        .collect();
+    out.sort_by_key(|s| s.address);
+    out
 }
 
 /// `[start, end)` virtual ranges of the PLT stub tables (`.plt`, `.plt.sec`,
@@ -500,6 +569,7 @@ fn collect_func_symbols(
                 out.push(FunctionSymbol {
                     address: sym.st_value,
                     name,
+                    size: (sym.st_size != 0).then_some(sym.st_size),
                     is_external: false,
                     library: None,
                 });
@@ -515,6 +585,7 @@ fn collect_func_symbols(
                 out.push(FunctionSymbol {
                     address: sym.st_value,
                     name,
+                    size: (sym.st_size != 0).then_some(sym.st_size),
                     is_external: false,
                     library: None,
                 });
@@ -606,12 +677,14 @@ fn collect_plt_symbols_inner(
                 out.push(FunctionSymbol {
                     address: sec_start + (i as u64) * plt_entry_size,
                     name,
+                    size: None,
                     is_external: true,
                     library: library.clone(),
                 });
                 out.push(FunctionSymbol {
                     address: plt_stub_addr,
                     name: None,
+                    size: None,
                     is_external: true,
                     library,
                 });
@@ -619,6 +692,7 @@ fn collect_plt_symbols_inner(
             None => out.push(FunctionSymbol {
                 address: plt_stub_addr,
                 name,
+                size: None,
                 is_external: true,
                 library,
             }),
@@ -728,6 +802,61 @@ impl BinaryFormat for ElfBinary {
 
     fn os(&self) -> crate::TargetOs {
         crate::TargetOs::Linux
+    }
+
+    fn endianness(&self) -> Endian {
+        self.endian
+    }
+
+    fn bits(&self) -> u32 {
+        if self.is_64 { 64 } else { 32 }
+    }
+
+    /// The allocated section headers, or, for a file whose section table
+    /// was stripped, the `PT_LOAD` segments named `LOAD0`, `LOAD1`, … so the
+    /// layout is still enumerable.
+    fn sections(&self) -> Vec<Section> {
+        if !self.sections.is_empty() {
+            return self
+                .sections
+                .iter()
+                .map(|s| Section {
+                    name: s.name.clone(),
+                    address: s.address,
+                    size: s.size,
+                    writable: s.writable,
+                    executable: s.executable,
+                })
+                .collect();
+        }
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| Section {
+                name: format!("LOAD{i}"),
+                address: seg.start,
+                size: seg.mem_size,
+                writable: seg.writable,
+                executable: seg.executable,
+            })
+            .collect()
+    }
+
+    fn symbols(&self) -> Vec<Symbol> {
+        self.analysis
+            .known_functions
+            .iter()
+            .filter_map(|f| {
+                let name = f.name.as_deref().filter(|n| !n.is_empty())?;
+                Some(Symbol {
+                    name: name.to_owned(),
+                    address: f.address,
+                    size: f.size,
+                    is_external: f.is_external,
+                    library: f.library.clone(),
+                })
+            })
+            .collect()
     }
 
     fn byte_at(&self, addr: u64) -> Option<u8> {
