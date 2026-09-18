@@ -231,24 +231,6 @@ impl Loaded {
             Loaded::Blob(_) => Vec::new(),
         }
     }
-
-    fn find_symbol(&self, name: &str) -> Option<u64> {
-        match self {
-            Loaded::Elf(b) => b
-                .analysis
-                .known_functions
-                .iter()
-                .find(|f| f.name.as_deref() == Some(name))
-                .map(|f| f.address),
-            Loaded::Pe(b) => b
-                .analysis
-                .known_functions
-                .iter()
-                .find(|f| f.name.as_deref() == Some(name))
-                .map(|f| f.address),
-            Loaded::Blob(_) => None,
-        }
-    }
 }
 
 fn bits_for_arch(arch: Arch) -> u32 {
@@ -319,7 +301,7 @@ fn run(opts: &Opts) -> Result<Output, String> {
     let symbols = opts.symbols.then(|| loaded.symbols());
     let symbol_lookup = opts.symbol.as_ref().map(|name| SymbolLookup {
         name: name.clone(),
-        address: loaded.find_symbol(name).map(|a| format!("{a:#x}")),
+        address: binary.symbol_address(name).map(|a| format!("{a:#x}")),
     });
     let read = match &opts.read {
         Some(spec) => {

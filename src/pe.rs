@@ -9,6 +9,7 @@ use goblin::pe::{
 };
 
 use crate::BinaryFormat;
+use crate::symbols::SymbolIndex;
 
 /// A known function start address extracted from PE metadata.
 #[derive(Debug, Clone)]
@@ -91,11 +92,19 @@ impl PeSection {
 }
 
 /// A parsed and loaded PE32/PE32+ executable image.
+///
+/// `analysis.known_functions` is sorted by address with one entry per
+/// address, and a name index is built alongside it, which is what the
+/// [`BinaryFormat::symbol_name`] / [`BinaryFormat::symbol_address`] lookups
+/// search. Both hold once parsing returns; mutating the table afterwards is
+/// not supported.
 #[derive(Debug, Clone)]
 pub struct PeBinary {
     pub load_address: u64,
     pub sections: Vec<PeSection>,
     pub analysis: PeAnalysis,
+    /// Function names -> addresses, over `analysis.known_functions`.
+    symbols: SymbolIndex,
     pub architecture: Arch,
     pub is_64: bool,
 }
@@ -184,8 +193,14 @@ impl PeBinary {
         collect_exception_function_symbols(&pe, &sections, &mut known_functions);
         uniquify_function_names(&mut known_functions);
 
+        // The sorted order is what `function_at` binary-searches.
         known_functions.sort_by_key(|f| (f.address, !f.is_external, f.name.is_none()));
         known_functions.dedup_by_key(|f| f.address);
+        let symbols = SymbolIndex::build(
+            known_functions
+                .iter()
+                .map(|f| (f.name.as_deref(), f.address, f.is_external)),
+        );
 
         Ok(Self {
             load_address,
@@ -196,9 +211,18 @@ impl PeBinary {
                 known_functions,
                 imports,
             },
+            symbols,
             architecture,
             is_64: pe.is_64,
         })
+    }
+
+    /// The known function starting at `addr`, by binary search over the
+    /// address-sorted table.
+    fn function_at(&self, addr: u64) -> Option<&PeFunctionSymbol> {
+        let functions = &self.analysis.known_functions;
+        let idx = functions.binary_search_by_key(&addr, |f| f.address).ok()?;
+        Some(&functions[idx])
     }
 
     fn import_at_iat(&self, addr: u64) -> Option<&PeImportSymbol> {
@@ -439,22 +463,23 @@ impl BinaryFormat for PeBinary {
     }
 
     fn symbol_name(&self, addr: u64) -> Option<&str> {
-        self.analysis
-            .known_functions
-            .iter()
-            .find(|f| f.address == addr)
+        self.function_at(addr)
             .and_then(|f| f.name.as_deref())
             .filter(|name| !name.is_empty())
             .or_else(|| (addr == self.analysis.entrypoint).then_some("_start"))
     }
 
+    /// The inverse of [`symbol_name`](BinaryFormat::symbol_name), including
+    /// the synthetic `_start` it gives an unnamed entrypoint.
+    fn symbol_address(&self, name: &str) -> Option<u64> {
+        self.symbols.address(name).or_else(|| {
+            let entry = self.analysis.entrypoint;
+            (name == "_start" && self.symbol_name(entry) == Some("_start")).then_some(entry)
+        })
+    }
+
     fn is_external_symbol(&self, addr: u64) -> bool {
-        self.analysis
-            .known_functions
-            .iter()
-            .find(|f| f.address == addr)
-            .map(|f| f.is_external)
-            .unwrap_or(false)
+        self.function_at(addr).is_some_and(|f| f.is_external)
     }
 
     fn entry_points(&self) -> Vec<u64> {
@@ -494,13 +519,7 @@ impl BinaryFormat for PeBinary {
         // direct `call [iat]` sites with no thunk) at the IAT slot itself.
         self.import_at_iat(addr)
             .map(|import| import.dll.as_str())
-            .or_else(|| {
-                self.analysis
-                    .known_functions
-                    .iter()
-                    .find(|f| f.address == addr)
-                    .and_then(|f| f.library.as_deref())
-            })
+            .or_else(|| self.function_at(addr).and_then(|f| f.library.as_deref()))
     }
 }
 
@@ -522,25 +541,50 @@ pub fn from_pe_machine(value: u16) -> Option<Arch> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn import_symbol_name_returns_iat_import_name() {
-        let pe = PeBinary {
+    /// A section-less image around `analysis`, indexed the way `parse` does it.
+    fn binary(mut analysis: PeAnalysis) -> PeBinary {
+        analysis
+            .known_functions
+            .sort_by_key(|f| (f.address, !f.is_external, f.name.is_none()));
+        analysis.known_functions.dedup_by_key(|f| f.address);
+        let symbols = SymbolIndex::build(
+            analysis
+                .known_functions
+                .iter()
+                .map(|f| (f.name.as_deref(), f.address, f.is_external)),
+        );
+        PeBinary {
             load_address: 0x400000,
             sections: vec![],
-            analysis: PeAnalysis {
-                image_base: 0x400000,
-                entrypoint: 0x401000,
-                known_functions: vec![],
-                imports: vec![PeImportSymbol {
-                    iat_address: 0x404000,
-                    name: "ExitProcess".to_string(),
-                    dll: "KERNEL32.DLL".to_string(),
-                    ordinal: None,
-                }],
-            },
+            analysis,
+            symbols,
             architecture: Arch::I386,
             is_64: false,
-        };
+        }
+    }
+
+    fn function(address: u64, name: &str, library: Option<&str>) -> PeFunctionSymbol {
+        PeFunctionSymbol {
+            address,
+            name: Some(name.to_string()),
+            is_external: library.is_some(),
+            library: library.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn import_symbol_name_returns_iat_import_name() {
+        let pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![],
+            imports: vec![PeImportSymbol {
+                iat_address: 0x404000,
+                name: "ExitProcess".to_string(),
+                dll: "KERNEL32.DLL".to_string(),
+                ordinal: None,
+            }],
+        });
 
         assert_eq!(pe.import_symbol_name(0x404000), Some("ExitProcess"));
         assert_eq!(pe.import_symbol_name(0x404004), None);
@@ -548,25 +592,58 @@ mod tests {
 
     #[test]
     fn entrypoint_returns_primary_pe_entrypoint() {
-        let pe = PeBinary {
-            load_address: 0x400000,
-            sections: vec![],
-            analysis: PeAnalysis {
-                image_base: 0x400000,
-                entrypoint: 0x401000,
-                known_functions: vec![PeFunctionSymbol {
-                    address: 0x402000,
-                    name: Some("main".to_string()),
-                    is_external: false,
-                    library: None,
-                }],
-                imports: vec![],
-            },
-            architecture: Arch::I386,
-            is_64: false,
-        };
+        let pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![function(0x402000, "main", None)],
+            imports: vec![],
+        });
 
         assert_eq!(pe.entrypoint(), Some(0x401000));
         assert!(pe.entry_points().contains(&0x401000));
+    }
+
+    #[test]
+    fn symbol_lookup_by_name_and_address_are_inverses() {
+        let pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![
+                function(0x402000, "main", None),
+                function(0x401100, "helper", None),
+                function(0x403000, "ExitProcess", Some("KERNEL32.DLL")),
+            ],
+            imports: vec![],
+        });
+
+        assert_eq!(pe.symbol_address("main"), Some(0x402000));
+        assert_eq!(pe.symbol_address("helper"), Some(0x401100));
+        assert_eq!(pe.symbol_address("ExitProcess"), Some(0x403000));
+        assert_eq!(pe.symbol_address("missing"), None);
+        assert_eq!(pe.symbol_name(0x402000), Some("main"));
+        assert_eq!(pe.symbol_name(0x401100), Some("helper"));
+        assert_eq!(pe.symbol_name(0x403000), Some("ExitProcess"));
+        assert_eq!(pe.symbol_name(0x402001), None);
+        assert!(pe.is_external_symbol(0x403000));
+        assert!(!pe.is_external_symbol(0x402000));
+        assert_eq!(pe.import_library(0x403000), Some("KERNEL32.DLL"));
+
+        // The unnamed entrypoint reads as `_start` both ways.
+        assert_eq!(pe.symbol_name(0x401000), Some("_start"));
+        assert_eq!(pe.symbol_address("_start"), Some(0x401000));
+    }
+
+    #[test]
+    fn named_entrypoint_is_not_also_start() {
+        let pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![function(0x401000, "mainCRTStartup", None)],
+            imports: vec![],
+        });
+
+        assert_eq!(pe.symbol_name(0x401000), Some("mainCRTStartup"));
+        assert_eq!(pe.symbol_address("mainCRTStartup"), Some(0x401000));
+        assert_eq!(pe.symbol_address("_start"), None);
     }
 }
