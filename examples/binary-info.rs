@@ -13,7 +13,7 @@ use std::{fs, process};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use wazabin_binary::{Arch, BinaryFormat, blob::Blob, elf::ElfBinary, pe::PeBinary};
+use wazabin_binary::{BinaryFormat, Endian, Format, LoadError, blob::Blob};
 
 /// Load a binary and report its container/format metadata.
 #[derive(Parser)]
@@ -71,6 +71,10 @@ struct Symbol {
     address: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    external: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    library: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -106,160 +110,57 @@ struct ReadResult {
     hex: String,
 }
 
-/// The three container kinds this crate can parse, unified behind
-/// [`BinaryFormat`] for the address-space queries and matched on directly for
-/// the format-specific section/symbol tables (the trait does not expose
-/// those).
-enum Loaded {
-    Elf(ElfBinary),
-    Pe(PeBinary),
-    Blob(Blob),
+/// A parsed file: the container the crate detected, or a raw blob when it
+/// detected none, behind the one trait every query below goes through.
+struct Loaded {
+    format: Option<Format>,
+    binary: Box<dyn BinaryFormat>,
 }
 
 impl Loaded {
-    fn as_binary_format(&self) -> &dyn BinaryFormat {
-        match self {
-            Loaded::Elf(b) => b,
-            Loaded::Pe(b) => b,
-            Loaded::Blob(b) => b,
-        }
-    }
-
-    fn format_name(&self) -> &'static str {
-        match self {
-            Loaded::Elf(_) => "elf",
-            Loaded::Pe(_) => "pe",
-            Loaded::Blob(_) => "blob",
-        }
-    }
-
-    fn bits(&self) -> u32 {
-        match self {
-            Loaded::Elf(b) => bits_for_arch(b.architecture),
-            Loaded::Pe(b) => {
-                if b.is_64 {
-                    64
-                } else {
-                    32
-                }
-            }
-            Loaded::Blob(_) => 64,
-        }
-    }
-
-    /// This crate does not record the byte order it parsed a container with
-    /// (ELF's `AnyEndian` is consumed internally, and PE/blob have no field
-    /// for it), so this is a guess from the architecture rather than a fact
-    /// read from the file. See the API-gaps note in the accompanying report.
-    fn endian(&self) -> &'static str {
-        match self {
-            Loaded::Elf(b) => endian_guess_for_arch(b.architecture),
-            Loaded::Pe(_) => "little",
-            Loaded::Blob(_) => "little",
-        }
+    fn format_name(&self) -> String {
+        self.format
+            .map_or_else(|| "blob".to_string(), |f| f.to_string())
     }
 
     fn sections(&self) -> Vec<Section> {
-        match self {
-            Loaded::Elf(b) => b
-                .segments
-                .iter()
-                .enumerate()
-                .map(|(i, seg)| Section {
-                    name: format!("LOAD{i}"),
-                    address: format!("{:#x}", seg.start),
-                    size: seg.mem_size,
-                    flags: format!(
-                        "r{}{}",
-                        if seg.writable { "w" } else { "-" },
-                        if seg.executable { "x" } else { "-" }
-                    ),
-                })
-                .collect(),
-            // `PeSection` records only the writable bit: the loader marks
-            // every mapped PE section executable by default (see
-            // `PeBinary::mapped_regions`), so the `x` flag here is not read
-            // from `IMAGE_SCN_MEM_EXECUTE` and is only an approximation.
-            Loaded::Pe(b) => b
-                .sections
-                .iter()
-                .enumerate()
-                .map(|(i, sec)| Section {
-                    name: format!("SECTION{i}"),
-                    address: format!("{:#x}", sec.start),
-                    size: sec.mem_size,
-                    flags: format!("r{}x", if sec.writable { "w" } else { "-" }),
-                })
-                .collect(),
-            Loaded::Blob(b) => vec![Section {
-                name: "blob".to_string(),
-                address: format!("{:#x}", b.load_address),
-                size: b.data.len() as u64,
-                flags: "rwx".to_string(),
-            }],
-        }
+        self.binary
+            .sections()
+            .into_iter()
+            .map(|s| Section {
+                name: s.name,
+                address: format!("{:#x}", s.address),
+                size: s.size,
+                flags: format!(
+                    "r{}{}",
+                    if s.writable { "w" } else { "-" },
+                    if s.executable { "x" } else { "-" }
+                ),
+            })
+            .collect()
     }
 
     fn symbols(&self) -> Vec<Symbol> {
-        match self {
-            // Neither ELF nor PE symbol collection in this crate records a
-            // symbol's size, so `size` is always `None` here.
-            Loaded::Elf(b) => b
-                .analysis
-                .known_functions
-                .iter()
-                .filter_map(|f| {
-                    f.name.as_ref().map(|name| Symbol {
-                        name: name.clone(),
-                        address: format!("{:#x}", f.address),
-                        size: None,
-                    })
-                })
-                .collect(),
-            Loaded::Pe(b) => b
-                .analysis
-                .known_functions
-                .iter()
-                .filter_map(|f| {
-                    f.name.as_ref().map(|name| Symbol {
-                        name: name.clone(),
-                        address: format!("{:#x}", f.address),
-                        size: None,
-                    })
-                })
-                .collect(),
-            Loaded::Blob(_) => Vec::new(),
-        }
-    }
-}
-
-fn bits_for_arch(arch: Arch) -> u32 {
-    match arch {
-        Arch::X86_64
-        | Arch::AArch64
-        | Arch::Ppc64
-        | Arch::Ia64
-        | Arch::SparcV9
-        | Arch::Alpha
-        | Arch::Mmix
-        | Arch::TILEGx
-        | Arch::LoongArch => 64,
-        _ => 32,
-    }
-}
-
-fn endian_guess_for_arch(arch: Arch) -> &'static str {
-    match arch {
-        Arch::Sparc | Arch::SparcV9 | Arch::S390 | Arch::M68K | Arch::Mips | Arch::MipsRs3Le => {
-            "big"
-        }
-        _ => "little",
+        self.binary
+            .symbols()
+            .into_iter()
+            .map(|s| Symbol {
+                name: s.name,
+                address: format!("{:#x}", s.address),
+                size: s.size,
+                external: s.is_external,
+                library: s.library,
+            })
+            .collect()
     }
 }
 
 fn parse_int(what: &str, value: &str) -> Result<u64, String> {
     let value = value.trim();
-    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(hex, 16),
         None => value.parse(),
     }
@@ -277,24 +178,20 @@ fn parse_read_arg(value: &str) -> Result<(u64, usize), String> {
 
 fn load(path: &str, base: u64) -> Result<Loaded, String> {
     let bytes = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    if bytes.len() >= 4 && &bytes[0..4] == b"\x7fELF" {
-        return ElfBinary::parse(&bytes)
-            .map(Loaded::Elf)
-            .map_err(|e| format!("failed to parse ELF: {e}"));
-    }
-    if bytes.len() >= 2 && &bytes[0..2] == b"MZ" {
-        return PeBinary::parse(&bytes)
-            .map(Loaded::Pe)
-            .map_err(|e| format!("failed to parse PE: {e}"));
-    }
-    Ok(Loaded::Blob(Blob::new(base, bytes)))
+    let format = Format::detect(&bytes);
+    let binary: Box<dyn BinaryFormat> = match wazabin_binary::load(&bytes) {
+        Ok(binary) => binary,
+        Err(LoadError::UnknownFormat) => Box::new(Blob::new(base, bytes)),
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(Loaded { format, binary })
 }
 
 fn run(opts: &Opts) -> Result<Output, String> {
     let path = opts.path.clone().ok_or_else(|| "give a path".to_string())?;
     let base = parse_int("base", &opts.base)?;
     let loaded = load(&path, base)?;
-    let binary = loaded.as_binary_format();
+    let binary = loaded.binary.as_ref();
 
     let entry = binary.entrypoint().map(|a| format!("{a:#x}"));
     let sections = opts.sections.then(|| loaded.sections());
@@ -320,10 +217,13 @@ fn run(opts: &Opts) -> Result<Output, String> {
 
     Ok(Output {
         path,
-        format: loaded.format_name().to_string(),
+        format: loaded.format_name(),
         arch: binary.architecture().to_string(),
-        bits: loaded.bits(),
-        endian: loaded.endian().to_string(),
+        bits: binary.bits(),
+        endian: match binary.endianness() {
+            Endian::Little => "little".to_string(),
+            Endian::Big => "big".to_string(),
+        },
         entry,
         sections,
         symbols,
@@ -352,22 +252,37 @@ fn main() {
 
     println!("path:   {}", output.path);
     println!("format: {}", output.format);
-    println!("arch:   {} ({}-bit, {}-endian)", output.arch, output.bits, output.endian);
+    println!(
+        "arch:   {} ({}-bit, {}-endian)",
+        output.arch, output.bits, output.endian
+    );
     println!("entry:  {}", output.entry.as_deref().unwrap_or("-"));
 
     if let Some(sections) = &output.sections {
         println!("\nsections:");
-        println!("{:<12} {:<12} {:<10} {:<6}", "name", "address", "size", "flags");
+        println!(
+            "{:<20} {:<12} {:<10} {:<6}",
+            "name", "address", "size", "flags"
+        );
         for s in sections {
-            println!("{:<12} {:<12} {:<10} {:<6}", s.name, s.address, s.size, s.flags);
+            println!(
+                "{:<20} {:<12} {:<10} {:<6}",
+                s.name, s.address, s.size, s.flags
+            );
         }
     }
 
     if let Some(symbols) = &output.symbols {
         println!("\nsymbols ({}):", symbols.len());
-        println!("{:<12} {}", "address", "name");
+        println!("{:<12} {:<8} name", "address", "size");
         for s in symbols {
-            println!("{:<12} {}", s.address, s.name);
+            let size = s.size.map_or_else(|| "-".to_string(), |n| n.to_string());
+            let origin = match (&s.external, &s.library) {
+                (true, Some(lib)) => format!("  [{lib}]"),
+                (true, None) => "  [import]".to_string(),
+                (false, _) => String::new(),
+            };
+            println!("{:<12} {:<8} {}{origin}", s.address, size, s.name);
         }
     }
 

@@ -5,6 +5,7 @@
 //! toolchain: an ELF64 header followed by three program headers, the first
 //! `PT_LOAD` covering the headers themselves as a linker would lay it out.
 
+use wazabin_binary::BinaryFormat;
 use wazabin_binary::elf::{ElfBinary, ElfKind};
 
 const EHDR: usize = 64;
@@ -157,4 +158,43 @@ fn a_table_no_segment_covers_has_no_address() {
     );
     let elf = ElfBinary::parse(&bytes).unwrap();
     assert_eq!(elf.program_headers.vaddr, None);
+}
+
+/// With no section table, the layout is still enumerable: the `PT_LOAD`
+/// segments stand in, named by index.
+#[test]
+fn stripped_section_table_falls_back_to_load_segments() {
+    let elf = ElfBinary::parse(&image(
+        2,
+        &[
+            Phdr {
+                kind: PT_LOAD,
+                flags: 5, // R+X
+                offset: 0,
+                vaddr: 0x400000,
+                filesz: 0x200,
+                memsz: 0x200,
+                align: 0x1000,
+            },
+            Phdr {
+                kind: PT_LOAD,
+                flags: 6, // R+W
+                offset: 0x200,
+                vaddr: 0x401000,
+                filesz: 0,
+                memsz: 0x100,
+                align: 0x1000,
+            },
+        ],
+    ))
+    .unwrap();
+
+    assert!(elf.sections.is_empty());
+    let sections = elf.sections();
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0].name, "LOAD0");
+    assert_eq!((sections[0].address, sections[0].size), (0x400000, 0x200));
+    assert!(sections[0].executable && !sections[0].writable);
+    assert_eq!(sections[1].name, "LOAD1");
+    assert!(sections[1].writable && !sections[1].executable);
 }

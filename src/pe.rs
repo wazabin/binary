@@ -5,11 +5,11 @@ use goblin::pe::{
         COFF_MACHINE_ARM, COFF_MACHINE_ARM64, COFF_MACHINE_ARMNT, COFF_MACHINE_X86,
         COFF_MACHINE_X86_64,
     },
-    symbol::Symbol,
+    symbol::Symbol as CoffSymbol,
 };
 
-use crate::BinaryFormat;
 use crate::symbols::SymbolIndex;
+use crate::{BinaryFormat, Endian, Section, Symbol};
 
 /// A known function start address extracted from PE metadata.
 #[derive(Debug, Clone)]
@@ -18,6 +18,9 @@ pub struct PeFunctionSymbol {
     pub address: u64,
     /// Symbol name, if present.
     pub name: Option<String>,
+    /// The function's size from its exception-directory (`RUNTIME_FUNCTION`)
+    /// entry. `None` when only a COFF symbol names it, or for import thunks.
+    pub size: Option<u64>,
     /// Whether this is an external imported function.
     pub is_external: bool,
     /// For an import thunk, the DLL the import comes from.
@@ -52,16 +55,23 @@ pub struct PeAnalysis {
 
 #[derive(Debug, Clone)]
 pub struct PeSection {
+    /// The section-table name, e.g. `.text`; empty when the header has none.
+    pub name: String,
     pub start: u64,
     pub mem_size: u64,
     pub data: Vec<u8>,
-    /// `IMAGE_SCN_MEM_WRITE` from the section characteristics. Unlike
-    /// executability (which the loader deliberately leaves permissive, see
-    /// [`BinaryFormat::mapped_regions`]), writability is read straight from the
-    /// section table, so a section without the bit is proven read-only.
+    /// `IMAGE_SCN_MEM_WRITE` from the section characteristics. Read straight
+    /// from the section table, so a section without the bit is proven
+    /// read-only.
     pub writable: bool,
+    /// `IMAGE_SCN_MEM_EXECUTE` from the section characteristics. Reported by
+    /// [`BinaryFormat::sections`]; the loader's [`BinaryFormat::mapped_regions`]
+    /// deliberately stays permissive and marks every section executable.
+    pub executable: bool,
 }
 
+/// `IMAGE_SCN_MEM_EXECUTE`: the section may be executed as code.
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 /// `IMAGE_SCN_MEM_WRITE`: the section is writable at run time.
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
@@ -158,10 +168,16 @@ impl PeBinary {
                     .unwrap_or(&[])
                     .to_vec();
                 PeSection {
+                    name: section
+                        .real_name
+                        .clone()
+                        .or_else(|| section.name().ok().map(str::to_owned))
+                        .unwrap_or_default(),
                     start,
                     mem_size,
                     data,
                     writable: section.characteristics & IMAGE_SCN_MEM_WRITE != 0,
+                    executable: section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
                 }
             })
             .filter(|s| s.mem_size > 0)
@@ -193,9 +209,19 @@ impl PeBinary {
         collect_exception_function_symbols(&pe, &sections, &mut known_functions);
         uniquify_function_names(&mut known_functions);
 
-        // The sorted order is what `function_at` binary-searches.
+        // The sorted order is what `function_at` binary-searches. A COFF
+        // symbol and an exception-directory entry for the same function
+        // collapse into the symbol's entry, which inherits the entry's size.
         known_functions.sort_by_key(|f| (f.address, !f.is_external, f.name.is_none()));
-        known_functions.dedup_by_key(|f| f.address);
+        known_functions.dedup_by(|dropped, kept| {
+            if dropped.address != kept.address {
+                return false;
+            }
+            if kept.size.is_none() {
+                kept.size = dropped.size;
+            }
+            true
+        });
         let symbols = SymbolIndex::build(
             known_functions
                 .iter()
@@ -255,6 +281,7 @@ fn collect_exception_function_symbols(
         out.push(PeFunctionSymbol {
             address,
             name: None,
+            size: Some(u64::from(function.end_address - function.begin_address)),
             is_external: false,
             library: None,
         });
@@ -282,6 +309,7 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
         out.push(PeFunctionSymbol {
             address,
             name: Some(name),
+            size: None,
             is_external: false,
             library: None,
         });
@@ -289,7 +317,7 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
 }
 
 fn symbol_name(
-    symbol: &Symbol,
+    symbol: &CoffSymbol,
     inline_name: Option<&str>,
     strings: Option<&goblin::strtab::Strtab<'_>>,
 ) -> Option<String> {
@@ -401,6 +429,48 @@ impl BinaryFormat for PeBinary {
 
     fn os(&self) -> crate::TargetOs {
         crate::TargetOs::Windows
+    }
+
+    /// PE is little-endian on every machine this crate maps.
+    fn endianness(&self) -> Endian {
+        Endian::Little
+    }
+
+    fn bits(&self) -> u32 {
+        if self.is_64 { 64 } else { 32 }
+    }
+
+    /// The section table, with the real `IMAGE_SCN_MEM_EXECUTE` bit (unlike
+    /// [`mapped_regions`](BinaryFormat::mapped_regions), which stays
+    /// permissive).
+    fn sections(&self) -> Vec<Section> {
+        self.sections
+            .iter()
+            .map(|s| Section {
+                name: s.name.clone(),
+                address: s.start,
+                size: s.mem_size,
+                writable: s.writable,
+                executable: s.executable,
+            })
+            .collect()
+    }
+
+    fn symbols(&self) -> Vec<Symbol> {
+        self.analysis
+            .known_functions
+            .iter()
+            .filter_map(|f| {
+                let name = f.name.as_deref().filter(|n| !n.is_empty())?;
+                Some(Symbol {
+                    name: name.to_owned(),
+                    address: f.address,
+                    size: f.size,
+                    is_external: f.is_external,
+                    library: f.library.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Import-directory DLL names in first-seen order, deduplicated
@@ -567,6 +637,7 @@ mod tests {
         PeFunctionSymbol {
             address,
             name: Some(name.to_string()),
+            size: None,
             is_external: library.is_some(),
             library: library.map(str::to_string),
         }
@@ -631,6 +702,87 @@ mod tests {
         // The unnamed entrypoint reads as `_start` both ways.
         assert_eq!(pe.symbol_name(0x401000), Some("_start"));
         assert_eq!(pe.symbol_address("_start"), Some(0x401000));
+    }
+
+    #[test]
+    fn enumerates_sections_and_named_symbols() {
+        let mut pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![
+                function(0x402000, "main", None),
+                PeFunctionSymbol {
+                    address: 0x402100,
+                    name: None,
+                    size: Some(0x40),
+                    is_external: false,
+                    library: None,
+                },
+                function(0x403000, "ExitProcess", Some("KERNEL32.DLL")),
+            ],
+            imports: vec![],
+        });
+        pe.sections = vec![
+            PeSection {
+                name: ".text".to_string(),
+                start: 0x401000,
+                mem_size: 0x1000,
+                data: vec![],
+                writable: false,
+                executable: true,
+            },
+            PeSection {
+                name: ".data".to_string(),
+                start: 0x404000,
+                mem_size: 0x200,
+                data: vec![],
+                writable: true,
+                executable: false,
+            },
+        ];
+
+        assert_eq!(
+            pe.sections(),
+            vec![
+                Section {
+                    name: ".text".to_string(),
+                    address: 0x401000,
+                    size: 0x1000,
+                    writable: false,
+                    executable: true,
+                },
+                Section {
+                    name: ".data".to_string(),
+                    address: 0x404000,
+                    size: 0x200,
+                    writable: true,
+                    executable: false,
+                },
+            ]
+        );
+        // The nameless exception-directory entry is a function start, not
+        // a symbol.
+        assert_eq!(
+            pe.symbols(),
+            vec![
+                Symbol {
+                    name: "main".to_string(),
+                    address: 0x402000,
+                    size: None,
+                    is_external: false,
+                    library: None,
+                },
+                Symbol {
+                    name: "ExitProcess".to_string(),
+                    address: 0x403000,
+                    size: None,
+                    is_external: true,
+                    library: Some("KERNEL32.DLL".to_string()),
+                },
+            ]
+        );
+        assert_eq!(pe.bits(), 32);
+        assert_eq!(pe.endianness(), Endian::Little);
     }
 
     #[test]
