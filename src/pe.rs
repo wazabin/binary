@@ -1,10 +1,12 @@
 use crate::Arch;
+use goblin::options::ParseMode;
 use goblin::pe::{
     PE,
     header::{
         COFF_MACHINE_ARM, COFF_MACHINE_ARM64, COFF_MACHINE_ARMNT, COFF_MACHINE_X86,
         COFF_MACHINE_X86_64,
     },
+    options::ParseOptions,
     symbol::Symbol as CoffSymbol,
 };
 
@@ -149,8 +151,15 @@ impl From<goblin::error::Error> for PeError {
 
 impl PeBinary {
     /// Parse a PE32/PE32+ executable from raw file bytes.
+    ///
+    /// Parsed in [`ParseMode::Permissive`]: goblin's default strict mode makes a
+    /// failure in any optional data directory fatal to the whole image, even one
+    /// this crate never reads (base relocations, say, when `.reloc` declares a
+    /// virtual size but no raw data). Permissive mode drops each directory it
+    /// cannot parse and keeps the rest; a well-formed file parses identically.
     pub fn parse(file_bytes: &[u8]) -> Result<Self, PeError> {
-        let pe = PE::parse(file_bytes)?;
+        let options = ParseOptions::default().with_parse_mode(ParseMode::Permissive);
+        let pe = PE::parse_with_opts(file_bytes, &options)?;
         let architecture = from_pe_machine(pe.header.coff_header.machine)
             .ok_or(PeError::UnsupportedMachine(pe.header.coff_header.machine))?;
 
@@ -610,6 +619,113 @@ pub fn from_pe_machine(value: u16) -> Option<Arch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal PE32 with two sections, whose `.reloc` declares a virtual size but carries no
+    /// raw data, and whose base relocation directory points into it.
+    ///
+    /// This is a truncated or stripped image: the section table still describes `.reloc`, the
+    /// optional header still points a data directory at it, and the bytes are simply not in the
+    /// file. Built here rather than checked in as a fixture so the shape is visible and the test
+    /// needs no binary.
+    fn pe32_with_unbacked_reloc_directory() -> Vec<u8> {
+        const PE_OFF: usize = 0x40;
+        const OPT_OFF: usize = PE_OFF + 4 + 20;
+        const OPT_SIZE: usize = 224;
+        const SEC_OFF: usize = OPT_OFF + OPT_SIZE;
+        const HEADERS: usize = 0x200;
+        const TEXT_RAW: usize = 0x200;
+
+        let mut b = vec![0u8; HEADERS + TEXT_RAW];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&(PE_OFF as u32).to_le_bytes());
+        b[PE_OFF..PE_OFF + 4].copy_from_slice(b"PE\0\0");
+
+        let coff = PE_OFF + 4;
+        b[coff..coff + 2].copy_from_slice(&COFF_MACHINE_X86.to_le_bytes()); // Machine
+        b[coff + 2..coff + 4].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+        b[coff + 16..coff + 18].copy_from_slice(&(OPT_SIZE as u16).to_le_bytes());
+        b[coff + 18..coff + 20].copy_from_slice(&0x0102u16.to_le_bytes()); // Characteristics
+
+        let mut w32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        w32(OPT_OFF, 0x0000_010b); // Magic = PE32 (low half), linker version in the high half
+        w32(OPT_OFF + 16, 0x1000); // AddressOfEntryPoint
+        w32(OPT_OFF + 20, 0x1000); // BaseOfCode
+        w32(OPT_OFF + 24, 0x2000); // BaseOfData
+        w32(OPT_OFF + 28, 0x0040_0000); // ImageBase
+        w32(OPT_OFF + 32, 0x1000); // SectionAlignment
+        w32(OPT_OFF + 36, 0x200); // FileAlignment
+        w32(OPT_OFF + 56, 0x3000); // SizeOfImage
+        w32(OPT_OFF + 60, HEADERS as u32); // SizeOfHeaders
+        w32(OPT_OFF + 68, 3); // Subsystem = console
+        w32(OPT_OFF + 92, 16); // NumberOfRvaAndSizes
+        // Data directory 5 is the base relocation table: it points at `.reloc`, which has no
+        // bytes in the file. This one directory is what strict parsing rejects the image for.
+        w32(OPT_OFF + 96 + 5 * 8, 0x2000);
+        w32(OPT_OFF + 96 + 5 * 8 + 4, 0x10);
+
+        // Section header `i`: name, then (field offset, value) pairs.
+        let section = |b: &mut Vec<u8>, i: usize, name: &[u8], fields: [(usize, u32); 5]| {
+            let o = SEC_OFF + i * 40;
+            b[o..o + name.len()].copy_from_slice(name);
+            for (k, v) in fields {
+                b[o + k..o + k + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        // Offsets: 8 VirtualSize, 12 VirtualAddress, 16 SizeOfRawData,
+        // 20 PointerToRawData, 36 Characteristics.
+        section(
+            &mut b,
+            0,
+            b".text",
+            [
+                (8, 0x10),
+                (12, 0x1000),
+                (16, TEXT_RAW as u32),
+                (20, HEADERS as u32),
+                (36, 0x6000_0020),
+            ],
+        );
+        // .reloc: a virtual size, and NO raw data.
+        section(
+            &mut b,
+            1,
+            b".reloc",
+            [
+                (8, 0x1000),
+                (12, 0x2000),
+                (16, 0),
+                (20, 0),
+                (36, 0x4200_0040),
+            ],
+        );
+        b
+    }
+
+    #[test]
+    fn parses_an_image_whose_reloc_directory_has_no_raw_data() {
+        let bytes = pe32_with_unbacked_reloc_directory();
+
+        // The hazard this guards, stated as an assertion: goblin's default (strict) mode makes a
+        // failure in ANY optional data directory fatal to the image. Should this ever start
+        // succeeding, the permissive option in `PeBinary::parse` has become unnecessary rather
+        // than wrong — and the doc comment there needs revisiting.
+        assert!(
+            PE::parse(&bytes).is_err(),
+            "strict parsing is expected to reject the unbacked base relocation directory"
+        );
+
+        let pe = PeBinary::parse(&bytes).expect("an unbacked .reloc must not reject the image");
+        assert_eq!(pe.architecture, Arch::I386);
+        assert_eq!(pe.entrypoint(), Some(0x0040_1000));
+        assert_eq!(pe.load_address, 0x0040_1000);
+        // Both sections are kept: `.reloc` is mapped, with no bytes behind it.
+        assert_eq!(pe.sections.len(), 2);
+        assert!(
+            pe.sections
+                .iter()
+                .any(|s| s.start == 0x0040_2000 && s.data.is_empty())
+        );
+    }
 
     /// A section-less image around `analysis`, indexed the way `parse` does it.
     fn binary(mut analysis: PeAnalysis) -> PeBinary {
