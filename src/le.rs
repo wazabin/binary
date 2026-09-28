@@ -434,10 +434,15 @@ impl LeBinary {
             }
             LeFixupKind::Relative32 => (target.wrapping_sub(at + 4) as u32).to_le_bytes().to_vec(),
         };
-        // A fixup may straddle the end of its object's file-backed bytes (the
-        // zero-filled tail): write what lands in `data`.
+        // A fixup may straddle the end of its object's file-backed bytes: the
+        // zero-filled tail is part of the object, so `data` grows to hold it
+        // (up to the virtual size). RUN.EXE's last fini record's pointer does.
         if let Some(obj) = self.objects.iter_mut().find(|o| o.contains(at)) {
             let off = (at - obj.base) as usize;
+            let end = (off + value.len()).min(obj.virtual_size as usize);
+            if obj.data.len() < end {
+                obj.data.resize(end, 0);
+            }
             for (i, b) in value.into_iter().enumerate() {
                 if let Some(slot) = obj.data.get_mut(off + i) {
                     *slot = b;
@@ -690,7 +695,8 @@ mod tests {
     /// - code+1: `mov eax, [data+0x10]` → Offset32 to object 2 offset 0x10
     /// - code+6: `call code+0x20`       → Relative32 to object 1 offset 0x20
     /// - code+0xb: far pointer          → Pointer16_32 to object 2 offset 4
-    /// - data+0 and data+8 (a source list) → Offset32 to object 1 offset 0x20
+    /// - data+0, data+8 and data+0x1e (a source list; the last straddles the
+    ///   end of the file-backed bytes) → Offset32 to object 1 offset 0x20
     pub(crate) fn sample() -> Vec<u8> {
         let le = 0x40usize;
         let page = 0x200u32;
@@ -757,8 +763,8 @@ mod tests {
         ]
         .concat();
         let page2: Vec<u8> = vec![
-            // Offset32, source list of 2, object 1, 32-bit offset 0x20; sources 0, 8
-            0x27, 0x10, 0x02, 0x01, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+            // Offset32, source list of 3, object 1, 32-bit offset 0x20; sources 0, 8, 0x1e
+            0x27, 0x10, 0x03, 0x01, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x1e, 0x00,
         ];
         let fr = le + 0x110;
         f[fr..fr + recs.len()].copy_from_slice(&recs);
@@ -795,6 +801,7 @@ mod tests {
         assert_eq!(b.read_uint(0x1000b, 4), Some(0x20004));
         assert_eq!(b.read_uint(0x20000, 4), Some(0x10020));
         assert_eq!(b.read_uint(0x20008, 4), Some(0x10020));
+        assert_eq!(b.read_uint(0x2001e, 4), Some(0x10020));
         // Unfixed data bytes and the zero-filled tail.
         assert_eq!(b.byte_at(0x20004), Some(0xcc));
         assert_eq!(b.byte_at(0x200ff), Some(0));
@@ -817,6 +824,7 @@ mod tests {
                 (0x1000b, LeFixupKind::Pointer16_32, Some(0x20004)),
                 (0x20000, LeFixupKind::Offset32, Some(0x10020)),
                 (0x20008, LeFixupKind::Offset32, Some(0x10020)),
+                (0x2001e, LeFixupKind::Offset32, Some(0x10020)),
             ]
         );
         assert!(LeFixupKind::Pointer16_32.has_selector());
