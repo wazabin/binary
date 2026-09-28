@@ -1,7 +1,7 @@
 //! Binary container formats and the [`BinaryFormat`] trait.
 //!
 //! This is a leaf crate below `qcode`: it holds the [`Arch`] enum, the
-//! [`TargetOs`] enum, and the ELF/PE/blob container parsers behind a single
+//! [`TargetOs`] enum, and the ELF/PE/LE/blob container parsers behind a single
 //! [`BinaryFormat`] trait. `qcode` re-exports [`TargetOs`] and (in Stage 2b)
 //! implements [`BinaryFormat`] for its serializable `MemoryImage`; `harbinger`
 //! re-exports this crate as `harbinger::format` and `harbinger::arch::Arch`.
@@ -13,6 +13,7 @@ mod target_os;
 pub mod blob;
 pub mod eh_frame;
 pub mod elf;
+pub mod le;
 pub mod pe;
 
 pub use arch::Arch;
@@ -32,11 +33,15 @@ pub enum Format {
     Elf,
     /// An `MZ` stub whose `e_lfanew` points at a `PE\0\0` signature.
     Pe,
+    /// An `MZ` stub whose `e_lfanew` points at an `LE` header: a DOS-extended
+    /// (DOS/4GW) program or a VxD.
+    Le,
 }
 
 impl Format {
     /// Sniff the container format from the start of a file, or `None` when
-    /// the bytes match neither (a raw blob, or a bare DOS `MZ` executable).
+    /// the bytes match none (a raw blob, a bare DOS `MZ` executable, or an
+    /// `LX`/`NE` one).
     pub fn detect(bytes: &[u8]) -> Option<Format> {
         if bytes.starts_with(b"\x7fELF") {
             return Some(Format::Elf);
@@ -46,6 +51,9 @@ impl Format {
             let at = u32::from_le_bytes(e_lfanew.try_into().ok()?) as usize;
             if bytes.get(at..at + 4) == Some(b"PE\0\0") {
                 return Some(Format::Pe);
+            }
+            if bytes.get(at..at + 2) == Some(b"LE") {
+                return Some(Format::Le);
             }
         }
         None
@@ -57,6 +65,7 @@ impl std::fmt::Display for Format {
         f.write_str(match self {
             Format::Elf => "elf",
             Format::Pe => "pe",
+            Format::Le => "le",
         })
     }
 }
@@ -64,19 +73,21 @@ impl std::fmt::Display for Format {
 /// Why [`load`] could not produce a binary.
 #[derive(Debug)]
 pub enum LoadError {
-    /// The bytes are neither ELF nor PE; callers that accept raw images can
+    /// The bytes are not ELF, PE or LE; callers that accept raw images can
     /// fall back to [`blob::Blob`] with a load address of their choosing.
     UnknownFormat,
     Elf(elf::ElfError),
     Pe(pe::PeError),
+    Le(le::LeError),
 }
 
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadError::UnknownFormat => write!(f, "not an ELF or PE file"),
+            LoadError::UnknownFormat => write!(f, "not an ELF, PE or LE file"),
             LoadError::Elf(e) => write!(f, "failed to parse ELF: {e}"),
             LoadError::Pe(e) => write!(f, "failed to parse PE: {e}"),
+            LoadError::Le(e) => write!(f, "failed to parse LE: {e}"),
         }
     }
 }
@@ -87,6 +98,7 @@ impl std::error::Error for LoadError {
             LoadError::UnknownFormat => None,
             LoadError::Elf(e) => Some(e),
             LoadError::Pe(e) => Some(e),
+            LoadError::Le(e) => Some(e),
         }
     }
 }
@@ -95,8 +107,9 @@ impl std::error::Error for LoadError {
 ///
 /// This is the entry point for callers that do not care which container
 /// they were handed: the result answers every [`BinaryFormat`] query. Match
-/// on [`Format::detect`] and call [`elf::ElfBinary::parse`] or
-/// [`pe::PeBinary::parse`] directly to keep the concrete type.
+/// on [`Format::detect`] and call [`elf::ElfBinary::parse`],
+/// [`pe::PeBinary::parse`] or [`le::LeBinary::parse`] directly to keep the
+/// concrete type.
 pub fn load(bytes: &[u8]) -> Result<Box<dyn BinaryFormat>, LoadError> {
     match Format::detect(bytes).ok_or(LoadError::UnknownFormat)? {
         Format::Elf => elf::ElfBinary::parse(bytes)
@@ -105,6 +118,9 @@ pub fn load(bytes: &[u8]) -> Result<Box<dyn BinaryFormat>, LoadError> {
         Format::Pe => pe::PeBinary::parse(bytes)
             .map(|b| Box::new(b) as Box<dyn BinaryFormat>)
             .map_err(LoadError::Pe),
+        Format::Le => le::LeBinary::parse(bytes)
+            .map(|b| Box::new(b) as Box<dyn BinaryFormat>)
+            .map_err(LoadError::Le),
     }
 }
 
@@ -482,6 +498,13 @@ mod tests {
         assert_eq!(Format::detect(b"MZ\x90\x00"), None);
         let mut dos = vec![0u8; 0x80];
         dos[..2].copy_from_slice(b"MZ");
+        assert_eq!(Format::detect(&dos), None);
+
+        // `LE` behind the stub; `LX` is not claimed.
+        dos[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        dos[0x40..0x42].copy_from_slice(b"LE");
+        assert_eq!(Format::detect(&dos), Some(Format::Le));
+        dos[0x40..0x42].copy_from_slice(b"LX");
         assert_eq!(Format::detect(&dos), None);
     }
 
