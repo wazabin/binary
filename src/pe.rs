@@ -64,9 +64,9 @@ pub struct PeSection {
     /// from the section table, so a section without the bit is proven
     /// read-only.
     pub writable: bool,
-    /// `IMAGE_SCN_MEM_EXECUTE` from the section characteristics. Reported by
-    /// [`BinaryFormat::sections`]; the loader's [`BinaryFormat::mapped_regions`]
-    /// deliberately stays permissive and marks every section executable.
+    /// `IMAGE_SCN_MEM_EXECUTE` from the section characteristics. Both
+    /// [`BinaryFormat::is_executable`] and [`BinaryFormat::mapped_regions`]
+    /// honour it, so a section without the bit is treated as data.
     pub executable: bool,
 }
 
@@ -440,9 +440,7 @@ impl BinaryFormat for PeBinary {
         if self.is_64 { 64 } else { 32 }
     }
 
-    /// The section table, with the real `IMAGE_SCN_MEM_EXECUTE` bit (unlike
-    /// [`mapped_regions`](BinaryFormat::mapped_regions), which stays
-    /// permissive).
+    /// The section table, with the real `IMAGE_SCN_MEM_EXECUTE` bit.
     fn sections(&self) -> Vec<Section> {
         self.sections
             .iter()
@@ -505,14 +503,22 @@ impl BinaryFormat for PeBinary {
             .map(|sec| {
                 let mut bytes = sec.data.clone();
                 bytes.resize(sec.mem_size as usize, 0);
-                // Mark every mapped section executable so resolved jump targets
-                // are not filtered out (the flag is only a permissive sanity
-                // check). Writability is the real `IMAGE_SCN_MEM_WRITE` bit, so
-                // a snapshot built from these regions can tell `.rdata` from
-                // `.data` exactly as the live binary does.
-                (sec.start, bytes, true, sec.writable)
+                // Both flags are the section table's own, so a snapshot built
+                // from these regions answers `is_executable` and
+                // `is_known_read_only` exactly as the live binary does.
+                (sec.start, bytes, sec.executable, sec.writable)
             })
             .collect()
+    }
+
+    /// Only a section with `IMAGE_SCN_MEM_EXECUTE` is executable; an address in
+    /// any other section, or in no section, is not. Without this override the
+    /// trait default answers "mapped", and a bogus branch target in `.data` is
+    /// decoded as code.
+    fn is_executable(&self, addr: u64) -> bool {
+        self.sections
+            .iter()
+            .any(|section| section.executable && section.contains(addr))
     }
 
     /// A mapped section without `IMAGE_SCN_MEM_WRITE` is proven read-only.
@@ -783,6 +789,39 @@ mod tests {
         );
         assert_eq!(pe.bits(), 32);
         assert_eq!(pe.endianness(), Endian::Little);
+    }
+
+    #[test]
+    fn only_sections_with_the_execute_bit_are_executable() {
+        let mut pe = binary(PeAnalysis {
+            image_base: 0x400000,
+            entrypoint: 0x401000,
+            known_functions: vec![],
+            imports: vec![],
+        });
+        let section = |name: &str, start: u64, executable: bool| PeSection {
+            name: name.to_string(),
+            start,
+            mem_size: 0x200,
+            data: vec![0x90; 0x10],
+            writable: !executable,
+            executable,
+        };
+        pe.sections = vec![
+            section(".text", 0x401000, true),
+            section(".data", 0x402000, false),
+        ];
+
+        assert!(pe.is_executable(0x401000));
+        assert!(!pe.is_executable(0x402000), ".data has no execute bit");
+        assert!(!pe.is_executable(0x500000), "unmapped");
+        // A snapshot built from the mapped regions must agree.
+        let flags: Vec<(u64, bool)> = pe
+            .mapped_regions()
+            .iter()
+            .map(|(start, _, exec, _)| (*start, *exec))
+            .collect();
+        assert_eq!(flags, vec![(0x401000, true), (0x402000, false)]);
     }
 
     #[test]
