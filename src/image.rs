@@ -44,6 +44,7 @@ const SHF_ALLOC: u64 = 2;
 const DT_NEEDED: i64 = 1;
 const DT_PLTRELSZ: i64 = 2;
 const DT_HASH: i64 = 4;
+const DT_PLTGOT: i64 = 3;
 const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
@@ -257,6 +258,10 @@ pub struct Dynamic<'a> {
     pub init_array: Option<(u64, u64)>,
     pub fini_array: Option<(u64, u64)>,
     pub preinit_array: Option<(u64, u64)>,
+    /// `DT_PLTGOT`: the address of the PLT's GOT (`.got.plt`).
+    pub pltgot: Option<u64>,
+    /// Where the table itself is: `PT_DYNAMIC`'s `(vaddr, memsz)`.
+    pub table: Option<(u64, u64)>,
     /// `DT_TEXTREL`, or `DT_FLAGS` with `DF_TEXTREL`: the code holds
     /// absolute addresses the loader patches.
     pub textrel: bool,
@@ -728,6 +733,8 @@ impl<'a> Image<'a> {
         }
         dynamic.init = tag(DT_INIT).filter(|&v| v != 0);
         dynamic.fini = tag(DT_FINI).filter(|&v| v != 0);
+        dynamic.pltgot = tag(DT_PLTGOT);
+        dynamic.table = dynamic_at;
         dynamic.textrel =
             tag(DT_TEXTREL).is_some() || tag(DT_FLAGS).is_some_and(|f| f & DF_TEXTREL != 0);
         let array = |at: i64, size: i64, sec: &str| -> Option<(u64, u64)> {
@@ -1234,12 +1241,74 @@ impl<'a> Image<'a> {
         )
     }
 
+    /// The file's own headers as a segment maps them: the ELF header with the
+    /// program header table (when a `PT_LOAD` maps the first bytes of the
+    /// file), and every `PT_NOTE`, as `[lo, hi)` ranges in address order. They
+    /// are neither code nor program data, though the segment that holds them
+    /// may be executable (a linker that does not separate code puts them in
+    /// front of `.text`).
+    pub fn headers(&self) -> Vec<(u64, u64)> {
+        let fmt = self.fmt;
+        let (phoff, phnum, phentsize) = if fmt.is_64 {
+            (
+                le64(self.file, 32),
+                le16(self.file, 56),
+                le16(self.file, 54),
+            )
+        } else {
+            (
+                le32(self.file, 28).map(u64::from),
+                le16(self.file, 44),
+                le16(self.file, 42),
+            )
+        };
+        let mut out = Vec::new();
+        if let (Some(phoff), Some(phnum), Some(phentsize)) = (phoff, phnum, phentsize)
+            && let Some(first) = self
+                .phdrs
+                .iter()
+                .find(|ph| ph.kind == PT_LOAD && ph.offset == 0)
+        {
+            let end = phoff + u64::from(phnum) * u64::from(phentsize);
+            if end <= first.filesz {
+                out.push((first.vaddr, first.vaddr + end));
+            }
+        }
+        for ph in self
+            .phdrs
+            .iter()
+            .filter(|ph| ph.kind == PT_NOTE && ph.memsz > 0)
+        {
+            out.push((ph.vaddr, ph.vaddr + ph.memsz));
+        }
+        out.sort();
+        out
+    }
+
     /// The loader's own metadata, as merged `[lo, hi)` ranges: the ELF header,
     /// the program headers, `PT_INTERP`, `PT_NOTE`, and the dynamic tables
     /// (symbols, strings, versions, hashes, relocations). No program object
     /// lives there (GNU ld's first segment holds nothing else; lld's goes on
     /// with `.rodata`), so a literal there is a number, not an address.
     pub fn metadata(&self) -> Vec<(u64, u64)> {
+        // Merged, across the alignment padding between them.
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for (a, e) in self.loader_tables() {
+            match out.last_mut() {
+                Some(last) if a <= last.1 + 64 => last.1 = last.1.max(e),
+                _ => out.push((a, e)),
+            }
+        }
+        out
+    }
+
+    /// Each of the loader's own tables as its own `[lo, hi)` range, in address
+    /// order (see [`metadata`](Self::metadata), which merges them): the ELF
+    /// header, the program header table, `PT_INTERP`, `PT_NOTE`, and the
+    /// string, symbol, version, hash and relocation tables the dynamic table
+    /// names. Where one ends the next kind of bytes begins, so their ends are
+    /// fences for a reader that walks a table.
+    pub fn loader_tables(&self) -> Vec<(u64, u64)> {
         let fmt = self.fmt;
         let mut ends: Vec<(u64, u64)> = Vec::new();
         let (phoff, phnum, phentsize, ehsize) = if fmt.is_64 {
@@ -1363,17 +1432,9 @@ impl<'a> Image<'a> {
                 ));
             }
         }
-        // Merged, across the alignment padding between them.
         ends.retain(|(a, e)| e > a);
         ends.sort();
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for (a, e) in ends {
-            match out.last_mut() {
-                Some(last) if a <= last.1 + 64 => last.1 = last.1.max(e),
-                _ => out.push((a, e)),
-            }
-        }
-        out
+        ends
     }
 
     // --- exception tables ---------------------------------------------------------

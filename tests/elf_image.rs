@@ -148,6 +148,8 @@ fn dynamic_table_names_the_constructors_and_libraries() {
     assert_eq!((d.init, d.fini), (Some(0x730), Some(0x740)));
     assert_eq!(d.init_array, Some((INIT_ARRAY, 16)));
     assert_eq!((d.fini_array, d.preinit_array), (None, None));
+    assert_eq!(d.pltgot, Some(0x3200));
+    assert_eq!(d.table, Some((0x3000, 0x150)));
     assert!(!d.textrel);
     assert_eq!(
         img.array_words(d.init_array.unwrap()),
@@ -157,8 +159,8 @@ fn dynamic_table_names_the_constructors_and_libraries() {
 
     let mut textrel = bytes.clone();
     // DT_FLAGS = DF_TEXTREL in the spare terminator slot's place.
-    textrel[0x1000 + 16 * 18..0x1000 + 16 * 18 + 8].copy_from_slice(&30u64.to_le_bytes());
-    textrel[0x1000 + 16 * 18 + 8..0x1000 + 16 * 18 + 16].copy_from_slice(&4u64.to_le_bytes());
+    textrel[0x1000 + 16 * 19..0x1000 + 16 * 19 + 8].copy_from_slice(&30u64.to_le_bytes());
+    textrel[0x1000 + 16 * 19 + 8..0x1000 + 16 * 19 + 16].copy_from_slice(&4u64.to_le_bytes());
     assert!(Image::load(&textrel).unwrap().dynamic.textrel);
 }
 
@@ -281,4 +283,27 @@ fn metadata_ranges_cover_the_loaders_tables_only() {
     assert!(covered(0), "the ELF header");
     assert!(covered(0x200) && covered(0x300) && covered(0x420) && covered(0x500));
     assert!(!covered(0x700), "text is not metadata");
+    // The tables apart: `.dynsym` and `.dynstr` abut and merge, but each ends
+    // where it ends.
+    let tables = img.loader_tables();
+    assert!(tables.contains(&(0x200, 0x300)), "{tables:x?}");
+    assert!(tables.windows(2).all(|w| w[0].0 <= w[1].0));
+}
+
+#[test]
+fn headers_are_the_elf_header_table_and_notes() {
+    let bytes = build(false);
+    let img = Image::load(&bytes).unwrap();
+    // The six program headers follow the 64-byte ELF header; no PT_NOTE here.
+    assert_eq!(img.headers(), [(0, 64 + 6 * 56)]);
+    // A note segment is a header range too.
+    let mut with_note = bytes.clone();
+    let ph = 64 + 56 * 5; // reuse PT_GNU_RELRO's slot
+    with_note[ph..ph + 4].copy_from_slice(&4u32.to_le_bytes());
+    with_note[ph + 16..ph + 24].copy_from_slice(&0x3c0u64.to_le_bytes());
+    with_note[ph + 40..ph + 48].copy_from_slice(&0x20u64.to_le_bytes());
+    assert_eq!(
+        Image::load(&with_note).unwrap().headers(),
+        [(0, 400), (0x3c0, 0x3e0)]
+    );
 }

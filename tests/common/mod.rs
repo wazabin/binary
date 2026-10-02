@@ -250,7 +250,7 @@ pub fn build(sections: bool) -> Vec<u8> {
     }
 
     // --- the second segment -------------------------------------------------------
-    let dynamic: [(i64, u64); 20] = [
+    let dynamic: [(i64, u64); 21] = [
         (1, u64::from(libc)),
         (12, 0x730),
         (13, 0x740),
@@ -269,6 +269,7 @@ pub fn build(sections: bool) -> Vec<u8> {
         (0x6fff_fffe, 0x3c0),
         (0x6fff_ffff, 1),
         (4, 0x3e0),
+        (3, 0x3200),
         (0, 0),
         (0, 0),
     ];
@@ -295,7 +296,7 @@ pub fn build(sections: bool) -> Vec<u8> {
     let phdrs: [(u32, u32, u64, u64, u64, u64, u64); 6] = [
         (1, 5, 0, 0, 0xa00, 0xa00, 0x1000),                // PT_LOAD R+X
         (1, 6, 0x1000, 0x3000, 0x408, 0x600, 0x1000),      // PT_LOAD R+W
-        (2, 6, 0x1000, 0x3000, 0x140, 0x140, 8),           // PT_DYNAMIC
+        (2, 6, 0x1000, 0x3000, 0x150, 0x150, 8),           // PT_DYNAMIC
         (7, 4, 0x1400, 0x3400, 8, 0x20, 8),                // PT_TLS
         (0x6474_e550, 4, 0x900, 0x900, 0x24, 0x24, 4),     // PT_GNU_EH_FRAME
         (0x6474_e552, 4, 0x1000, 0x3000, 0x200, 0x200, 1), // PT_GNU_RELRO
@@ -348,7 +349,7 @@ fn add_sections(b: &mut Buf) {
         (".gcc_except_table", 1, 2, 0x800, 0x800, 0x20, 0, 0),
         (".eh_frame_hdr", 1, 2, 0x900, 0x900, 0x24, 0, 0),
         (".eh_frame", 1, 2, 0x940, 0x940, 0xa0, 0, 0),
-        (".dynamic", 6, 3, 0x3000, 0x1000, 0x140, 2, 16),
+        (".dynamic", 6, 3, 0x3000, 0x1000, 0x150, 2, 16),
         (".init_array", 14, 3, INIT_ARRAY, 0x1300, 16, 0, 8),
         (".tbss", 8, 0x403, 0x3410, 0x1410, 0x10, 0, 0),
         (".symtab", 2, 0, 0, 0x1440, 48, 17, 24),
