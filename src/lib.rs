@@ -11,8 +11,10 @@ mod symbols;
 mod target_os;
 
 pub mod blob;
+pub mod eh;
 pub mod eh_frame;
 pub mod elf;
+pub mod image;
 pub mod le;
 pub mod pe;
 
@@ -76,6 +78,8 @@ pub enum LoadError {
     /// The bytes are not ELF, PE or LE; callers that accept raw images can
     /// fall back to [`blob::Blob`] with a load address of their choosing.
     UnknownFormat,
+    /// The bytes are a container [`image::Image`] does not read yet.
+    Unsupported(Format),
     Elf(elf::ElfError),
     Pe(pe::PeError),
     Le(le::LeError),
@@ -85,6 +89,7 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::UnknownFormat => write!(f, "not an ELF, PE or LE file"),
+            LoadError::Unsupported(fmt) => write!(f, "{fmt} is not supported here"),
             LoadError::Elf(e) => write!(f, "failed to parse ELF: {e}"),
             LoadError::Pe(e) => write!(f, "failed to parse PE: {e}"),
             LoadError::Le(e) => write!(f, "failed to parse LE: {e}"),
@@ -95,7 +100,7 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LoadError::UnknownFormat => None,
+            LoadError::UnknownFormat | LoadError::Unsupported(_) => None,
             LoadError::Elf(e) => Some(e),
             LoadError::Pe(e) => Some(e),
             LoadError::Le(e) => Some(e),

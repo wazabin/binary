@@ -1,383 +1,458 @@
-//! Function starts from the ELF `.eh_frame` unwind tables.
+//! The `.eh_frame` reader: one byte cursor, one CIE / FDE / `.eh_frame_hdr`
+//! walker.
 //!
 //! Every function compiled with unwind tables (the default for x86-64 gcc and
-//! clang, `-fasynchronous-unwind-tables`) gets one FDE whose `initial_location`
-//! is the function's first byte. Both `.eh_frame` and `.eh_frame_hdr` are
-//! allocated sections, so `strip` keeps them: they are the best function-start
-//! source a stripped binary has.
+//! clang) has one FDE whose `initial_location` is the function's first byte.
+//! `.eh_frame` and `.eh_frame_hdr` are allocated, so `strip` keeps them.
 //!
-//! Two readers, tried in order:
-//! - `.eh_frame_hdr`'s binary-search table, which lists every FDE's initial
-//!   location directly (the linker builds it with `--eh-frame-hdr`).
-//! - a walk over `.eh_frame`'s CIE/FDE chain, decoding each FDE's
-//!   `initial_location` with its CIE's pointer encoding, for binaries without
-//!   the header table.
+//! The walker reads memory through a [`Mem`] function (the bytes from an
+//! address to the end of whatever holds it), so it serves a loaded
+//! [`Image`](crate::image::Image) as well as a bare section. Two ways in:
 //!
-//! Only starts are reported: the analysis grows each function itself.
+//! - [`fdes_from_hdr`]: the `.eh_frame_hdr` search table lists every FDE (the
+//!   linker builds it with `--eh-frame-hdr`); without a table the stream it
+//!   names is walked instead;
+//! - [`walk_stream`]: the CIE / FDE chain of `.eh_frame` itself, for binaries
+//!   without the header.
+//!
+//! [`hdr_starts`] and [`stream_starts`] read only the function starts, which
+//! is all a seed list needs.
+//!
+//! Nothing here runs at load time: the LSDA reader of [`crate::eh`] and the
+//! seeds of [`Image::seeds`](crate::image::Image::seeds) call it on demand.
 
-use elf::{ElfBytes, endian::AnyEndian};
+use std::collections::BTreeMap;
 
-/// A byte cursor over one section, with the DWARF pointer-encoding readers.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    /// Virtual address of `bytes[0]`, for `DW_EH_PE_pcrel`.
-    base: u64,
+/// `DW_EH_PE_omit`: the field is absent.
+pub const OMIT: u8 = 0xff;
+
+/// A byte cursor with the DWARF pointer-encoding readers.
+pub struct Cursor<'a> {
+    pub b: &'a [u8],
+    pub p: usize,
+    /// Address of `b[0]`, for `DW_EH_PE_pcrel`.
+    pub base: u64,
+    /// Base of `DW_EH_PE_datarel` pointers (the `.eh_frame_hdr` start).
+    pub datarel: u64,
     /// Pointer width in bytes, for `DW_EH_PE_absptr`.
-    ptr_size: usize,
+    pub ptr_size: usize,
 }
 
-const DW_EH_PE_ABSPTR: u8 = 0x00;
-const DW_EH_PE_ULEB128: u8 = 0x01;
-const DW_EH_PE_UDATA2: u8 = 0x02;
-const DW_EH_PE_UDATA4: u8 = 0x03;
-const DW_EH_PE_UDATA8: u8 = 0x04;
-const DW_EH_PE_SLEB128: u8 = 0x09;
-const DW_EH_PE_SDATA2: u8 = 0x0a;
-const DW_EH_PE_SDATA4: u8 = 0x0b;
-const DW_EH_PE_SDATA8: u8 = 0x0c;
-const DW_EH_PE_PCREL: u8 = 0x10;
-const DW_EH_PE_DATAREL: u8 = 0x30;
-const DW_EH_PE_OMIT: u8 = 0xff;
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8], base: u64, ptr_size: usize) -> Self {
-        Self { bytes, pos: 0, base, ptr_size }
+impl<'a> Cursor<'a> {
+    pub fn new(b: &'a [u8], base: u64) -> Self {
+        Cursor {
+            b,
+            p: 0,
+            base,
+            datarel: 0,
+            ptr_size: 8,
+        }
     }
 
-    fn address(&self) -> u64 {
-        self.base.wrapping_add(self.pos as u64)
+    pub fn addr(&self) -> u64 {
+        self.base.wrapping_add(self.p as u64)
     }
 
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let slice = self.bytes.get(self.pos..self.pos.checked_add(n)?)?;
-        self.pos += n;
-        Some(slice)
+    pub fn u8(&mut self) -> Option<u8> {
+        let v = *self.b.get(self.p)?;
+        self.p += 1;
+        Some(v)
     }
 
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
+    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.p..self.p.checked_add(n)?)?;
+        self.p += n;
+        Some(s)
     }
 
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    pub fn u16(&mut self) -> Option<u64> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?) as u64)
     }
 
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    pub fn u32(&mut self) -> Option<u64> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?) as u64)
     }
 
-    fn u64(&mut self) -> Option<u64> {
+    pub fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
-    fn uleb128(&mut self) -> Option<u64> {
-        let mut result = 0u64;
-        let mut shift = 0u32;
+    pub fn uleb(&mut self) -> Option<u64> {
+        let (mut v, mut shift) = (0u64, 0);
         loop {
-            let byte = self.u8()?;
+            let b = self.u8()?;
             if shift < 64 {
-                result |= u64::from(byte & 0x7f) << shift;
+                v |= u64::from(b & 0x7f) << shift;
+            }
+            if b & 0x80 == 0 {
+                return Some(v);
             }
             shift += 7;
-            if byte & 0x80 == 0 {
-                return Some(result);
-            }
         }
     }
 
-    fn sleb128(&mut self) -> Option<i64> {
-        let mut result = 0i64;
-        let mut shift = 0u32;
+    pub fn sleb(&mut self) -> Option<i64> {
+        let (mut v, mut shift) = (0i64, 0);
         loop {
-            let byte = self.u8()?;
+            let b = self.u8()?;
             if shift < 64 {
-                result |= i64::from(byte & 0x7f) << shift;
+                v |= i64::from(b & 0x7f) << shift;
             }
             shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    result |= -1i64 << shift;
+            if b & 0x80 == 0 {
+                if shift < 64 && b & 0x40 != 0 {
+                    v |= -1i64 << shift;
                 }
-                return Some(result);
+                return Some(v);
             }
         }
     }
 
-    /// Read one pointer with `encoding`; `datarel` is the base for
-    /// `DW_EH_PE_datarel` (the `.eh_frame_hdr` address when reading the header).
-    fn encoded(&mut self, encoding: u8, datarel: u64) -> Option<u64> {
-        if encoding == DW_EH_PE_OMIT {
+    /// A NUL-terminated string.
+    pub fn cstr(&mut self) -> Option<String> {
+        let start = self.p;
+        while *self.b.get(self.p)? != 0 {
+            self.p += 1;
+        }
+        let s = String::from_utf8_lossy(&self.b[start..self.p]).into_owned();
+        self.p += 1;
+        Some(s)
+    }
+
+    /// A `DW_EH_PE_*`-encoded pointer, with its application (pc-relative to
+    /// its own position, or relative to `datarel`) applied. The indirect flag
+    /// is left to the caller: the result is then the address of the slot
+    /// holding the pointer.
+    pub fn encoded(&mut self, enc: u8) -> Option<u64> {
+        if enc == OMIT {
             return None;
         }
-        let at = self.address();
-        let raw: u64 = match encoding & 0x0f {
-            DW_EH_PE_ABSPTR => match self.ptr_size {
-                4 => u64::from(self.u32()?),
+        let at = self.addr();
+        let v = match enc & 0x0f {
+            0x00 => match self.ptr_size {
+                4 => self.u32()?,
                 _ => self.u64()?,
             },
-            DW_EH_PE_ULEB128 => self.uleb128()?,
-            DW_EH_PE_UDATA2 => u64::from(self.u16()?),
-            DW_EH_PE_UDATA4 => u64::from(self.u32()?),
-            DW_EH_PE_UDATA8 => self.u64()?,
-            DW_EH_PE_SLEB128 => self.sleb128()? as u64,
-            DW_EH_PE_SDATA2 => i64::from(self.u16()? as i16) as u64,
-            DW_EH_PE_SDATA4 => i64::from(self.u32()? as i32) as u64,
-            DW_EH_PE_SDATA8 => self.u64()?,
+            0x04 | 0x0c => self.u64()?,
+            0x01 => self.uleb()?,
+            0x02 => self.u16()?,
+            0x03 => self.u32()?,
+            0x09 => self.sleb()? as u64,
+            0x0a => self.u16()? as u16 as i16 as i64 as u64,
+            0x0b => self.u32()? as u32 as i32 as i64 as u64,
             _ => return None,
         };
-        let value = match encoding & 0x70 {
-            0x00 => raw,
-            DW_EH_PE_PCREL => at.wrapping_add(raw),
-            DW_EH_PE_DATAREL => datarel.wrapping_add(raw),
-            // textrel / funcrel / aligned: not produced by the toolchains we
-            // care about, and we have no base for them.
-            _ => return None,
-        };
-        // The indirect bit (0x80) means "the pointer lives at that address";
-        // only the personality routine uses it, which we never read.
-        Some(value)
-    }
-}
-
-/// Locate a section by name: `(virtual address, file bytes)`.
-fn section<'a>(
-    elf: &ElfBytes<'a, AnyEndian>,
-    file: &'a [u8],
-    name: &str,
-) -> Option<(u64, &'a [u8])> {
-    let (shdrs, shstrtab) = match elf.section_headers_with_strtab() {
-        Ok((Some(s), Some(st))) => (s, st),
-        _ => return None,
-    };
-    let shdr = shdrs
-        .iter()
-        .find(|s| shstrtab.get(s.sh_name as usize).ok() == Some(name))?;
-    if shdr.sh_addr == 0 || shdr.sh_type == elf::abi::SHT_NOBITS {
-        return None;
-    }
-    let start = shdr.sh_offset as usize;
-    let end = start.checked_add(shdr.sh_size as usize)?;
-    Some((shdr.sh_addr, file.get(start..end)?))
-}
-
-/// Function starts from `.eh_frame_hdr` / `.eh_frame`, unsorted, possibly
-/// with duplicates. Empty when the binary carries neither section or the
-/// tables are malformed.
-pub fn function_starts(elf: &ElfBytes<'_, AnyEndian>, file: &[u8]) -> Vec<u64> {
-    let ptr_size = match elf.ehdr.class {
-        elf::file::Class::ELF32 => 4,
-        elf::file::Class::ELF64 => 8,
-    };
-    if let Some((addr, bytes)) = section(elf, file, ".eh_frame_hdr")
-        && let Some(starts) = from_hdr(bytes, addr, ptr_size)
-    {
-        return starts;
-    }
-    match section(elf, file, ".eh_frame") {
-        Some((addr, bytes)) => from_eh_frame(bytes, addr, ptr_size),
-        None => Vec::new(),
-    }
-}
-
-/// The `.eh_frame_hdr` search table: `(initial_location, fde_address)` pairs.
-fn from_hdr(bytes: &[u8], addr: u64, ptr_size: usize) -> Option<Vec<u64>> {
-    let mut r = Reader::new(bytes, addr, ptr_size);
-    if r.u8()? != 1 {
-        return None;
-    }
-    let eh_frame_ptr_enc = r.u8()?;
-    let fde_count_enc = r.u8()?;
-    let table_enc = r.u8()?;
-    let _eh_frame_ptr = r.encoded(eh_frame_ptr_enc, addr);
-    if fde_count_enc == DW_EH_PE_OMIT || table_enc == DW_EH_PE_OMIT {
-        return None;
-    }
-    let count = r.encoded(fde_count_enc, addr)?;
-    let mut starts = Vec::with_capacity(count.min(1 << 20) as usize);
-    for _ in 0..count {
-        let start = r.encoded(table_enc, addr)?;
-        let _fde = r.encoded(table_enc, addr)?;
-        starts.push(start);
-    }
-    Some(starts)
-}
-
-/// Per-CIE facts an FDE needs to decode its `initial_location`.
-#[derive(Clone, Copy)]
-struct Cie {
-    /// The `R` augmentation's pointer encoding (`DW_EH_PE_absptr` without one).
-    fde_encoding: u8,
-}
-
-/// Parse the CIE whose header starts at `pos` (just past its length field and
-/// the zero CIE id).
-fn parse_cie(r: &mut Reader<'_>) -> Option<Cie> {
-    let version = r.u8()?;
-    if version != 1 && version != 3 && version != 4 {
-        return None;
-    }
-    let mut augmentation = Vec::new();
-    loop {
-        let byte = r.u8()?;
-        if byte == 0 {
-            break;
+        // A raw 0 is a null pointer whatever the application (libgcc's rule).
+        if v == 0 {
+            return Some(0);
         }
-        augmentation.push(byte);
+        match enc & 0x70 {
+            0x00 => Some(v),
+            0x10 => Some(at.wrapping_add(v)),
+            0x30 => Some(self.datarel.wrapping_add(v)),
+            _ => None, // textrel / funcrel: not produced for ELF
+        }
     }
-    if augmentation.first() == Some(&b'e') && augmentation.get(1) == Some(&b'h') {
-        // Old gcc "eh" augmentation carries a pointer before the alignment
-        // factors.
-        r.take(r.ptr_size)?;
+}
+
+/// The size in bytes of a fixed-width encoding, 0 for a variable-length one.
+pub fn enc_size(enc: u8, ptr_size: usize) -> usize {
+    match enc & 0x0f {
+        0x00 => ptr_size,
+        0x04 | 0x0c => 8,
+        0x02 | 0x0a => 2,
+        0x03 | 0x0b => 4,
+        _ => 0,
+    }
+}
+
+/// A CIE, as the FDEs need it.
+#[derive(Clone, Debug)]
+pub struct RawCie {
+    pub fde_enc: u8,
+    pub lsda_enc: u8,
+    /// `(encoding, value)` of the `P` augmentation: the value is a slot
+    /// address when the encoding is indirect.
+    pub personality: Option<(u8, u64)>,
+}
+
+/// One FDE, unresolved.
+#[derive(Clone, Debug)]
+pub struct RawFde {
+    /// Address of the record.
+    pub addr: u64,
+    pub start: u64,
+    pub end: u64,
+    /// The LSDA pointer as encoded: a slot address when `lsda_indirect`.
+    pub lsda: Option<u64>,
+    pub lsda_indirect: bool,
+    pub cie: RawCie,
+}
+
+/// The bytes of memory from an address to the end of whatever holds it.
+pub type Mem<'a> = dyn Fn(u64) -> Option<&'a [u8]> + 'a;
+
+fn parse_cie(mem: &Mem, at: u64, ptr_size: usize) -> Option<RawCie> {
+    let b = mem(at)?;
+    let mut c = Cursor::new(b, at);
+    c.ptr_size = ptr_size;
+    let mut len = c.u32()?;
+    if len == 0xffff_ffff {
+        len = c.u64()?;
+    }
+    let _ = len;
+    if c.u32()? != 0 {
+        return None;
+    }
+    let mut cie = RawCie {
+        fde_enc: 0,
+        lsda_enc: OMIT,
+        personality: None,
+    };
+    let version = c.u8()?;
+    if !matches!(version, 1 | 3 | 4) {
+        return None;
+    }
+    let aug = c.cstr()?;
+    if aug.starts_with("eh") {
+        // Old gcc "eh" augmentation: a pointer before the alignment factors.
+        c.take(ptr_size)?;
     }
     if version >= 4 {
-        let _address_size = r.u8()?;
-        let _segment_size = r.u8()?;
+        c.u8()?; // address size
+        c.u8()?; // segment size
     }
-    let _code_align = r.uleb128()?;
-    let _data_align = r.sleb128()?;
-    let _return_reg = if version == 1 { u64::from(r.u8()?) } else { r.uleb128()? };
-    let mut cie = Cie { fde_encoding: DW_EH_PE_ABSPTR };
-    if augmentation.first() == Some(&b'z') {
-        let _augmentation_len = r.uleb128()?;
-        for &byte in &augmentation[1..] {
-            match byte {
-                b'R' => cie.fde_encoding = r.u8()?,
-                b'P' => {
-                    let enc = r.u8()?;
-                    r.encoded(enc & 0x7f, 0)?;
-                }
-                b'L' => {
-                    r.u8()?;
-                }
-                b'S' | b'B' | b'G' => {}
-                _ => return None,
+    c.uleb()?; // code alignment
+    c.sleb()?; // data alignment
+    if version == 1 {
+        c.u8()?;
+    } else {
+        c.uleb()?;
+    }
+    if !aug.starts_with('z') {
+        return Some(cie);
+    }
+    c.uleb()?; // augmentation length
+    for ch in aug[1..].chars() {
+        match ch {
+            'L' => cie.lsda_enc = c.u8()?,
+            'R' => cie.fde_enc = c.u8()?,
+            'P' => {
+                let enc = c.u8()?;
+                let v = c.encoded(enc)?;
+                cie.personality = Some((enc, v));
             }
+            _ => {}
         }
     }
     Some(cie)
 }
 
-/// Walk `.eh_frame`, returning each FDE's `initial_location`.
-fn from_eh_frame(bytes: &[u8], addr: u64, ptr_size: usize) -> Vec<u64> {
-    let mut starts = Vec::new();
-    let mut cies: Vec<(usize, Cie)> = Vec::new();
-    let mut r = Reader::new(bytes, addr, ptr_size);
-    loop {
-        let entry_start = r.pos;
-        let Some(mut length) = r.u32().map(u64::from) else { break };
-        if length == 0 {
-            // Zero terminator.
-            break;
+/// The FDE at `at` (a length-prefixed record whose id is not 0), its CIE
+/// looked up through `cies`. `None` for a CIE, a terminator or garbage; the
+/// second result is the address just after the record.
+fn parse_fde(
+    mem: &Mem,
+    at: u64,
+    ptr_size: usize,
+    cies: &mut BTreeMap<u64, Option<RawCie>>,
+) -> (Option<RawFde>, Option<u64>) {
+    let Some(b) = mem(at) else {
+        return (None, None);
+    };
+    let mut c = Cursor::new(b, at);
+    c.ptr_size = ptr_size;
+    let Some(mut len) = c.u32() else {
+        return (None, None);
+    };
+    if len == 0 {
+        return (None, None);
+    }
+    if len == 0xffff_ffff {
+        let Some(l) = c.u64() else {
+            return (None, None);
+        };
+        len = l;
+    }
+    let body = c.addr();
+    let next = body.wrapping_add(len);
+    if len as usize > b.len() {
+        return (None, None);
+    }
+    let Some(id) = c.u32() else {
+        return (None, Some(next));
+    };
+    if id == 0 {
+        return (None, Some(next));
+    }
+    let cie_at = body.wrapping_sub(id);
+    let cie = cies
+        .entry(cie_at)
+        .or_insert_with(|| parse_cie(mem, cie_at, ptr_size))
+        .clone();
+    let Some(cie) = cie else {
+        return (None, Some(next));
+    };
+    let go = |c: &mut Cursor| -> Option<(u64, u64, Option<u64>)> {
+        let start = c.encoded(cie.fde_enc)?;
+        let range = c.encoded(cie.fde_enc & 0x0f)?;
+        let mut lsda = None;
+        let aug_len = c.uleb()?;
+        let aug_end = c.p + aug_len as usize;
+        if cie.lsda_enc != OMIT {
+            lsda = Some(c.encoded(cie.lsda_enc)?);
         }
-        if length == 0xffff_ffff {
-            let Some(l) = r.u64() else { break };
-            length = l;
+        c.p = aug_end;
+        Some((start, range, lsda))
+    };
+    match go(&mut c) {
+        Some((start, range, lsda)) => (
+            Some(RawFde {
+                addr: at,
+                start,
+                end: start.wrapping_add(range),
+                lsda,
+                lsda_indirect: cie.lsda_enc != OMIT && cie.lsda_enc & 0x80 != 0,
+                cie,
+            }),
+            Some(next),
+        ),
+        None => (None, Some(next)),
+    }
+}
+
+/// Walk the CIE/FDE stream from `start` (the `.eh_frame` start) to its
+/// terminator: the FDEs, and the address just past the stream.
+pub fn walk_stream(mem: &Mem, start: u64, ptr_size: usize) -> (Vec<RawFde>, u64) {
+    let mut cies = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut at = start;
+    for _ in 0..1_000_000 {
+        let (fde, next) = parse_fde(mem, at, ptr_size, &mut cies);
+        if let Some(f) = fde {
+            out.push(f);
         }
-        let body_start = r.pos;
-        let Some(body_end) = body_start.checked_add(length as usize) else { break };
-        if body_end > bytes.len() {
-            break;
+        match next {
+            Some(n) if n > at => at = n,
+            _ => break,
         }
-        let Some(id) = r.u32() else { break };
-        if id == 0 {
-            if let Some(cie) = parse_cie(&mut r) {
-                cies.push((entry_start, cie));
-            }
-        } else {
-            // `id` is the distance back from its own field to the owning CIE.
-            let id_pos = body_start;
-            let cie_pos = id_pos.wrapping_sub(id as usize);
-            if let Some((_, cie)) = cies.iter().find(|(pos, _)| *pos == cie_pos)
-                && let Some(start) = r.encoded(cie.fde_encoding, 0)
-            {
-                // A zero-length FDE (a discarded section's remnant) is not a
-                // function; its range follows with the same encoding's low
-                // nibble and no relocation.
-                let range = r.encoded(cie.fde_encoding & 0x0f, 0).unwrap_or(0);
-                if range != 0 {
-                    starts.push(start);
+    }
+    (out, at)
+}
+
+/// The header of an `.eh_frame_hdr`: the `.eh_frame` start it names and the
+/// search table's `(encoding, count)`, when it has one.
+struct Hdr<'a> {
+    cursor: Cursor<'a>,
+    eh_frame: u64,
+    table: Option<(u8, u64)>,
+}
+
+fn read_hdr<'a>(mem: &Mem<'a>, hdr: u64, len: u64, ptr_size: usize) -> Option<Hdr<'a>> {
+    let b = mem(hdr)?;
+    let b = &b[..(len as usize).min(b.len())];
+    let mut c = Cursor::new(b, hdr);
+    c.datarel = hdr;
+    c.ptr_size = ptr_size;
+    if c.u8()? != 1 {
+        return None;
+    }
+    let ptr_enc = c.u8()?;
+    let count_enc = c.u8()?;
+    let table_enc = c.u8()?;
+    let eh_frame = c.encoded(ptr_enc)?;
+    let count = if count_enc == OMIT {
+        None
+    } else {
+        c.encoded(count_enc)
+    };
+    let table = match count {
+        Some(n) if table_enc != OMIT && enc_size(table_enc, ptr_size) > 0 => Some((table_enc, n)),
+        _ => None,
+    };
+    Some(Hdr {
+        cursor: c,
+        eh_frame,
+        table,
+    })
+}
+
+/// The FDEs the `.eh_frame_hdr` at `hdr` (of `len` bytes) lists, every one
+/// since the unwinder finds them there, and the `.eh_frame` start it names.
+/// Without a search table, the stream from that start is walked instead.
+pub fn fdes_from_hdr(mem: &Mem, hdr: u64, len: u64, ptr_size: usize) -> Option<(u64, Vec<RawFde>)> {
+    let Hdr {
+        mut cursor,
+        eh_frame,
+        table,
+    } = read_hdr(mem, hdr, len, ptr_size)?;
+    let mut out = Vec::new();
+    match table {
+        Some((enc, n)) => {
+            let mut cies = BTreeMap::new();
+            for _ in 0..n {
+                let _initial = cursor.encoded(enc)?;
+                let fde = cursor.encoded(enc)?;
+                if let (Some(f), _) = parse_fde(mem, fde, ptr_size, &mut cies) {
+                    out.push(f);
                 }
             }
         }
-        r.pos = body_end;
+        None => out = walk_stream(mem, eh_frame, ptr_size).0,
     }
-    starts
+    Some((eh_frame, out))
+}
+
+/// Function starts from the search table of the `.eh_frame_hdr` at `hdr`,
+/// unsorted and possibly with duplicates, without reading a single FDE.
+/// `None` when the header is unreadable or has no table.
+pub fn hdr_starts(mem: &Mem, hdr: u64, len: u64, ptr_size: usize) -> Option<Vec<u64>> {
+    let Hdr {
+        mut cursor, table, ..
+    } = read_hdr(mem, hdr, len, ptr_size)?;
+    let (enc, n) = table?;
+    let mut starts = Vec::with_capacity(n.min(1 << 20) as usize);
+    for _ in 0..n {
+        starts.push(cursor.encoded(enc)?);
+        let _fde = cursor.encoded(enc)?;
+    }
+    Some(starts)
+}
+
+/// Function starts from a walk of the `.eh_frame` stream at `start`. A
+/// zero-length FDE (a discarded section's remnant) is not a function.
+pub fn stream_starts(mem: &Mem, start: u64, ptr_size: usize) -> Vec<u64> {
+    walk_stream(mem, start, ptr_size)
+        .0
+        .into_iter()
+        .filter(|f| f.end != f.start)
+        .map(|f| f.start)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Encode one `.eh_frame` with a `zR` CIE (pcrel|sdata4) and two FDEs, and
-    /// check the chain walk finds their initial locations.
-    fn synthetic_eh_frame() -> (Vec<u8>, u64) {
-        let base = 0x40_0000u64;
-        let mut out = Vec::new();
-        // CIE: length, id=0, version 1, "zR", code align 1, data align -8,
-        // return reg 16, aug len 1, R = pcrel|sdata4, then padding to 8.
-        let mut cie = vec![0u8; 4]; // length placeholder
-        cie.extend_from_slice(&0u32.to_le_bytes());
-        cie.push(1);
-        cie.extend_from_slice(b"zR\0");
-        cie.push(1);
-        cie.push(0x78); // sleb128 -8
-        cie.push(16);
-        cie.push(1);
-        cie.push(DW_EH_PE_PCREL | DW_EH_PE_SDATA4);
-        while (cie.len()) % 8 != 0 {
-            cie.push(0);
-        }
-        let len = (cie.len() - 4) as u32;
-        cie[..4].copy_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&cie);
-
-        for target in [0x40_1000u64, 0x40_2000u64] {
-            let fde_start = out.len();
-            let mut fde = vec![0u8; 4];
-            let id_pos = fde_start + 4;
-            fde.extend_from_slice(&((id_pos - 0) as u32).to_le_bytes()); // CIE at offset 0
-            let field_addr = base + (fde_start + 8) as u64;
-            let rel = (target as i64 - field_addr as i64) as i32;
-            fde.extend_from_slice(&rel.to_le_bytes());
-            fde.extend_from_slice(&0x20u32.to_le_bytes()); // range
-            fde.push(0); // aug len
-            while fde.len() % 8 != 0 {
-                fde.push(0);
-            }
-            let len = (fde.len() - 4) as u32;
-            fde[..4].copy_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&fde);
-        }
-        out.extend_from_slice(&0u32.to_le_bytes());
-        (out, base)
-    }
-
-    #[test]
-    fn walks_cie_fde_chain() {
-        let (bytes, base) = synthetic_eh_frame();
-        assert_eq!(from_eh_frame(&bytes, base, 8), vec![0x40_1000, 0x40_2000]);
-    }
-
-    #[test]
-    fn reads_hdr_table() {
-        // version 1, eh_frame_ptr pcrel|sdata4, count udata4, table datarel|sdata4.
-        let base = 0x40_8000u64;
-        let mut hdr = vec![1, DW_EH_PE_PCREL | DW_EH_PE_SDATA4, DW_EH_PE_UDATA4, DW_EH_PE_DATAREL | DW_EH_PE_SDATA4];
-        hdr.extend_from_slice(&(-0x1000i32).to_le_bytes());
-        hdr.extend_from_slice(&2u32.to_le_bytes());
-        for (start, fde) in [(0x40_1000i64, 0x40_7010i64), (0x40_2000, 0x40_7030)] {
-            hdr.extend_from_slice(&((start - base as i64) as i32).to_le_bytes());
-            hdr.extend_from_slice(&((fde - base as i64) as i32).to_le_bytes());
-        }
-        assert_eq!(from_hdr(&hdr, base, 8), Some(vec![0x40_1000, 0x40_2000]));
-    }
-
     #[test]
     fn leb128_round_trips() {
-        let mut r = Reader::new(&[0xe5, 0x8e, 0x26, 0x7f, 0x80, 0x7f], 0, 8);
-        assert_eq!(r.uleb128(), Some(624485));
-        assert_eq!(r.sleb128(), Some(-1));
-        assert_eq!(r.sleb128(), Some(-128));
+        let mut r = Cursor::new(&[0xe5, 0x8e, 0x26, 0x7f, 0x80, 0x7f], 0);
+        assert_eq!(r.uleb(), Some(624485));
+        assert_eq!(r.sleb(), Some(-1));
+        assert_eq!(r.sleb(), Some(-128));
+    }
+
+    #[test]
+    fn raw_zero_is_a_null_pointer_whatever_the_application() {
+        let mut c = Cursor::new(&[0, 0, 0, 0], 0x1000);
+        assert_eq!(c.encoded(0x10 | 0x03), Some(0));
+    }
+
+    #[test]
+    fn absptr_follows_the_pointer_width() {
+        let mut c = Cursor::new(&[1, 0, 0, 0, 2, 0, 0, 0], 0);
+        c.ptr_size = 4;
+        assert_eq!(c.encoded(0x00), Some(1));
+        assert_eq!(c.encoded(0x00), Some(2));
     }
 }

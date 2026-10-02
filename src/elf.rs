@@ -10,6 +10,7 @@ use elf::{
 
 use crate::{Arch, BinaryFormat, Endian, Section, Symbol};
 
+use crate::image::Seed;
 use crate::symbols::SymbolIndex;
 
 /// A known function start address extracted from an ELF symbol table.
@@ -49,6 +50,11 @@ pub struct ElfAnalysis {
     pub entrypoint: u64,
     /// Function start addresses discovered via `.symtab` / `.dynsym`.
     pub known_functions: Vec<FunctionSymbol>,
+    /// Function starts the file's metadata names, apart from its symbols:
+    /// `.eh_frame` FDE starts and the loader's constructor / destructor
+    /// entry points (see [`Image::seeds`](crate::image::Image::seeds)).
+    /// Unsorted, nameless, possibly overlapping `known_functions`.
+    pub seeds: Vec<Seed>,
     /// Imported functions keyed by resolver slot address.
     pub imported_symbols: Vec<ImportSymbol>,
 }
@@ -104,7 +110,7 @@ pub enum ElfKind {
 }
 
 impl ElfKind {
-    fn from_e_type(value: u16) -> Self {
+    pub(crate) fn from_e_type(value: u16) -> Self {
         match value {
             ET_EXEC => ElfKind::Executable,
             ET_DYN => ElfKind::SharedObject,
@@ -185,8 +191,10 @@ impl LoadSegment {
 /// time:
 /// - **Entrypoint**: `e_entry` from the ELF header.
 /// - **Known functions**: all `STT_FUNC` symbols found in `.symtab` or
-///   `.dynsym`, PLT stubs, and every `.eh_frame` FDE start (nameless, but
-///   they survive `strip`).
+///   `.dynsym`, and PLT stubs.
+/// - **Seeds**: every `.eh_frame` FDE start (nameless, but they survive
+///   `strip`) and the constructor / destructor entry points, in
+///   [`ElfAnalysis::seeds`], apart from the symbol-derived functions.
 ///
 /// `known_functions` and `imported_symbols` are sorted by address with one
 /// entry per address, and a name index is built alongside them, which is
@@ -228,6 +236,13 @@ pub enum ElfError {
     NoLoadableSegment,
     /// The ELF file header number does not match any arch
     UnknownArch,
+    /// A header or table lies outside the file.
+    Truncated(&'static str),
+    /// A `PT_LOAD` segment's file bytes lie outside the file (its `vaddr`).
+    SegmentOutOfBounds(u64),
+    /// An ELF flavour [`image::Image`](crate::image::Image) does not read
+    /// (big-endian, an unknown class).
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for ElfError {
@@ -236,6 +251,11 @@ impl std::fmt::Display for ElfError {
             ElfError::Parse(e) => write!(f, "ELF parse error: {e}"),
             ElfError::NoLoadableSegment => write!(f, "ELF contains no PT_LOAD segment"),
             ElfError::UnknownArch => write!(f, "ELF has an unknown arch"),
+            ElfError::Truncated(what) => write!(f, "ELF {what} lie outside the file"),
+            ElfError::SegmentOutOfBounds(vaddr) => {
+                write!(f, "PT_LOAD at {vaddr:#x}: file range out of bounds")
+            }
+            ElfError::Unsupported(what) => write!(f, "unsupported ELF: {what}"),
         }
     }
 }
@@ -305,47 +325,14 @@ impl ElfBinary {
         // --- Analysis pass 5: DT_NEEDED shared-library sonames -----------------
         let needed_libraries = collect_needed_libraries(&elf);
 
-        // --- Analysis pass 6: `.eh_frame` FDE starts ---------------------------
-        // Pushed last so a named symbol at the same address wins the dedup
-        // below. Skipped for the PLT stub tables (their FDE covers the whole
-        // table, and the stubs are already listed by name) and for anything
-        // outside executable memory (a stale FDE in a hand-edited binary).
-        let plt_ranges = plt_section_ranges(&elf);
-        for addr in crate::eh_frame::function_starts(&elf, file_bytes) {
-            let in_plt = plt_ranges.iter().any(|(s, e)| addr >= *s && addr < *e);
-            let executable = load_segments
-                .iter()
-                .any(|seg| seg.executable && seg.contains(addr));
-            if !in_plt && executable {
-                known_functions.push(FunctionSymbol {
-                    address: addr,
-                    name: None,
-                    size: None,
-                    is_external: false,
-                    library: None,
-                });
-            }
-        }
-
-        // --- Analysis pass 7: constructor / destructor entry points -----------
-        // The crt functions `frame_dummy` and `__do_global_dtors_aux` have no
-        // FDE, but the loader reaches them through `.init_array` /
-        // `.fini_array` (and `DT_INIT` / `DT_FINI`), so those pointer tables
-        // are function starts too.
-        for addr in init_fini_entries(&elf, &load_segments) {
-            let executable = load_segments
-                .iter()
-                .any(|seg| seg.executable && seg.contains(addr));
-            if executable {
-                known_functions.push(FunctionSymbol {
-                    address: addr,
-                    name: None,
-                    size: None,
-                    is_external: false,
-                    library: None,
-                });
-            }
-        }
+        // --- Analysis pass 6: metadata seeds -----------------------------------
+        // `.eh_frame` FDE starts and the loader's constructor / destructor
+        // entry points: function starts that are not symbols. Kept apart from
+        // `known_functions`, so a caller that wants only what the symbol
+        // tables and the PLT name can have it.
+        let seeds = crate::image::Image::load(file_bytes)
+            .map(|img| img.seeds())
+            .unwrap_or_default();
 
         // --- The section table, for callers that want names -------------------
         let sections = collect_sections(&elf);
@@ -404,6 +391,7 @@ impl ElfBinary {
             analysis: ElfAnalysis {
                 entrypoint,
                 known_functions,
+                seeds,
                 imported_symbols,
             },
             symbols,
@@ -458,75 +446,6 @@ fn collect_sections(elf: &ElfBytes<AnyEndian>) -> Vec<ElfSection> {
         })
         .collect();
     out.sort_by_key(|s| s.address);
-    out
-}
-
-/// `[start, end)` virtual ranges of the PLT stub tables (`.plt`, `.plt.sec`,
-/// `.plt.got`), for excluding their FDEs from function discovery.
-fn plt_section_ranges(elf: &ElfBytes<AnyEndian>) -> Vec<(u64, u64)> {
-    let (shdrs, shstrtab) = match elf.section_headers_with_strtab() {
-        Ok((Some(s), Some(st))) => (s, st),
-        _ => return Vec::new(),
-    };
-    shdrs
-        .iter()
-        .filter(|s| {
-            matches!(
-                shstrtab.get(s.sh_name as usize).ok(),
-                Some(".plt" | ".plt.sec" | ".plt.got")
-            )
-        })
-        .map(|s| (s.sh_addr, s.sh_addr + s.sh_size))
-        .collect()
-}
-
-/// Function pointers stored in `.preinit_array` / `.init_array` /
-/// `.fini_array`, plus the `DT_INIT` / `DT_FINI` dynamic entries. Read from
-/// the loaded image, so a non-PIE binary yields absolute addresses and a PIE
-/// (whose slots hold `R_X86_64_RELATIVE` addends) its link-time ones.
-fn init_fini_entries(elf: &ElfBytes<AnyEndian>, segments: &[LoadSegment]) -> Vec<u64> {
-    let ptr_size = match elf.ehdr.class {
-        elf::file::Class::ELF32 => 4,
-        elf::file::Class::ELF64 => 8,
-    };
-    let read_ptr = |addr: u64| -> Option<u64> {
-        let seg = segments.iter().find(|s| s.contains(addr))?;
-        let bytes = seg.bytes_at(addr)?;
-        match ptr_size {
-            4 => Some(u64::from(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))),
-            _ => Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
-        }
-    };
-    let mut out = Vec::new();
-    if let Ok((Some(shdrs), Some(shstrtab))) = elf.section_headers_with_strtab() {
-        for shdr in shdrs.iter() {
-            if !matches!(
-                shstrtab.get(shdr.sh_name as usize).ok(),
-                Some(".preinit_array" | ".init_array" | ".fini_array")
-            ) {
-                continue;
-            }
-            let mut slot = shdr.sh_addr;
-            let end = shdr.sh_addr.saturating_add(shdr.sh_size);
-            while slot + ptr_size as u64 <= end {
-                match read_ptr(slot) {
-                    // `0` and `-1` are the linker's empty / sentinel slots.
-                    Some(0) | Some(u64::MAX) | None => {}
-                    Some(target) => out.push(target),
-                }
-                slot += ptr_size as u64;
-            }
-        }
-    }
-    if let Ok(Some(dynamic)) = elf.dynamic() {
-        for entry in dynamic.iter() {
-            if (entry.d_tag == elf::abi::DT_INIT || entry.d_tag == elf::abi::DT_FINI)
-                && entry.d_ptr() != 0
-            {
-                out.push(entry.d_ptr());
-            }
-        }
-    }
     out
 }
 
@@ -956,6 +875,9 @@ impl BinaryFormat for ElfBinary {
         let mut entries = vec![self.analysis.entrypoint];
         for f in &self.analysis.known_functions {
             entries.push(f.address);
+        }
+        for seed in &self.analysis.seeds {
+            entries.push(seed.addr);
         }
         entries.sort();
         entries.dedup();
