@@ -339,7 +339,8 @@ fn add_sections(b: &mut Buf) {
 
     let mut shstr = Names::new();
     // (name, type, flags, addr, offset, size, link, entsize)
-    let secs: [(&str, u32, u64, u64, u64, u64, u32, u64); 17] = [
+    type Sec = (&'static str, u32, u64, u64, u64, u64, u32, u64);
+    let secs: [Sec; 17] = [
         (".dynsym", 11, 2, 0x200, 0x200, 24 * 8, 2, 24),
         (".dynstr", 3, 2, 0x300, 0x300, 0xa0, 0, 0),
         (".gnu.version", 0x6fff_ffff, 2, 0x3a0, 0x3a0, 16, 1, 2),
