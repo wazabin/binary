@@ -5,6 +5,11 @@
 //! [`BinaryFormat`] trait. `qcode` re-exports [`TargetOs`] and (in Stage 2b)
 //! implements [`BinaryFormat`] for its serializable `MemoryImage`; `harbinger`
 //! re-exports this crate as `harbinger::format` and `harbinger::arch::Arch`.
+//!
+//! [`image::Image`] is the other way in: a borrowed, one-pass loader view of an
+//! ELF file (segments, relocations, symbols, imports, the dynamic table, TLS),
+//! with the exception tables ([`eh`], read through [`eh_frame`]) and the
+//! metadata function seeds on demand.
 
 mod arch;
 mod symbols;
