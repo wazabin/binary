@@ -220,8 +220,9 @@ pub struct Import<'a> {
     /// canonical PLT entry known only from an undefined `.dynsym` value (an
     /// address-taken import).
     pub slot: Option<u64>,
-    /// The PLT stub (`.plt`, `.plt.sec`, `.plt.got`) found by scanning
-    /// executable memory for `jmp *slot(%rip)`.
+    /// A PLT stub (`.plt`, `.plt.sec`, `.plt.got`) found by scanning
+    /// executable memory for `jmp *slot(%rip)`. Several stubs may jump through
+    /// one slot; each is an import of its own.
     pub stub: Option<u64>,
     /// Which kind of stub that is; `None` when there is no stub, or when the
     /// address is a canonical PLT entry (known from `.dynsym` alone).
@@ -1069,9 +1070,9 @@ impl<'a> Image<'a> {
                 i += 1;
             }
         }
-        let mut stub_of: HashMap<u64, (u64, StubKind)> = HashMap::new();
+        let mut stubs_of: HashMap<u64, Vec<(u64, StubKind)>> = HashMap::new();
         for &(va, slot, _, kind) in &stubs {
-            stub_of.entry(slot).or_insert((va, kind));
+            stubs_of.entry(slot).or_default().push((va, kind));
         }
 
         // The name of each address, in the order of authority: stubs, GOT
@@ -1080,17 +1081,33 @@ impl<'a> Image<'a> {
         for &(va, _, sym, _) in &stubs {
             names.entry(va).or_insert(self.symbols[sym].name);
         }
+        // One import per stub: several stubs may jump through one slot (a
+        // runtime's per-library thunks), and each is a name for it.
         let mut imports = Vec::new();
         for &(slot, sym) in &got_slots {
             let s = &self.symbols[sym];
             names.entry(slot).or_insert(s.name);
-            imports.push(Import {
-                slot: Some(slot),
-                stub: stub_of.get(&slot).map(|s| s.0),
-                stub_kind: stub_of.get(&slot).map(|s| s.1),
-                name: s.name,
-                library: self.symbol_library(sym),
-            });
+            let library = self.symbol_library(sym);
+            match stubs_of.get(&slot) {
+                Some(found) => {
+                    for &(va, kind) in found {
+                        imports.push(Import {
+                            slot: Some(slot),
+                            stub: Some(va),
+                            stub_kind: Some(kind),
+                            name: s.name,
+                            library,
+                        });
+                    }
+                }
+                None => imports.push(Import {
+                    slot: Some(slot),
+                    stub: None,
+                    stub_kind: None,
+                    name: s.name,
+                    library,
+                }),
+            }
         }
         for (idx, s) in self.symbols[..self.dynsym_count].iter().enumerate() {
             if !s.defined && s.addr != 0 && !s.name.is_empty() && !names.contains_key(&s.addr) {
@@ -1241,12 +1258,12 @@ impl<'a> Image<'a> {
         )
     }
 
-    /// The file's own headers as a segment maps them: the ELF header with the
-    /// program header table (when a `PT_LOAD` maps the first bytes of the
-    /// file), and every `PT_NOTE`, as `[lo, hi)` ranges in address order. They
-    /// are neither code nor program data, though the segment that holds them
-    /// may be executable (a linker that does not separate code puts them in
-    /// front of `.text`).
+    /// The ELF header with the program header table, as a segment maps it
+    /// (when a `PT_LOAD` maps the first bytes of the file), and the
+    /// [`notes`](Self::notes), as `[lo, hi)` ranges in address order. They are
+    /// neither code nor program data, though the segment that holds them may
+    /// be executable (a linker that does not separate code puts them in front
+    /// of `.text`).
     pub fn headers(&self) -> Vec<(u64, u64)> {
         let fmt = self.fmt;
         let (phoff, phnum, phentsize) = if fmt.is_64 {
@@ -1274,15 +1291,28 @@ impl<'a> Image<'a> {
                 out.push((first.vaddr, first.vaddr + end));
             }
         }
-        for ph in self
+        out.extend(self.notes());
+        out.sort();
+        out
+    }
+
+    /// The `PT_NOTE` ranges in address order; notes that abut are one range.
+    pub fn notes(&self) -> Vec<(u64, u64)> {
+        let mut notes: Vec<(u64, u64)> = self
             .phdrs
             .iter()
             .filter(|ph| ph.kind == PT_NOTE && ph.memsz > 0)
-        {
-            out.push((ph.vaddr, ph.vaddr + ph.memsz));
+            .map(|ph| (ph.vaddr, ph.vaddr + ph.memsz))
+            .collect();
+        notes.sort();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in notes {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
         }
-        out.sort();
-        out
+        merged
     }
 
     /// The loader's own metadata, as merged `[lo, hi)` ranges: the ELF header,
@@ -1291,9 +1321,19 @@ impl<'a> Image<'a> {
     /// lives there (GNU ld's first segment holds nothing else; lld's goes on
     /// with `.rodata`), so a literal there is a number, not an address.
     pub fn metadata(&self) -> Vec<(u64, u64)> {
+        let mut all = self.loader_tables();
+        all.extend(self.headers());
+        all.extend(
+            self.phdrs
+                .iter()
+                .filter(|ph| ph.kind == PT_PHDR)
+                .map(|ph| (ph.vaddr, ph.vaddr + ph.memsz)),
+        );
+        all.retain(|(a, e)| e > a);
+        all.sort();
         // Merged, across the alignment padding between them.
         let mut out: Vec<(u64, u64)> = Vec::new();
-        for (a, e) in self.loader_tables() {
+        for (a, e) in all {
             match out.last_mut() {
                 Some(last) if a <= last.1 + 64 => last.1 = last.1.max(e),
                 _ => out.push((a, e)),
@@ -1302,46 +1342,16 @@ impl<'a> Image<'a> {
         out
     }
 
-    /// Each of the loader's own tables as its own `[lo, hi)` range, in address
-    /// order (see [`metadata`](Self::metadata), which merges them): the ELF
-    /// header, the program header table, `PT_INTERP`, `PT_NOTE`, and the
-    /// string, symbol, version, hash and relocation tables the dynamic table
-    /// names. Where one ends the next kind of bytes begins, so their ends are
-    /// fences for a reader that walks a table.
+    /// Each of the tables the loader reads, other than the file's own headers
+    /// ([`headers`](Self::headers)), as its own `[lo, hi)` range in address
+    /// order: `PT_INTERP`, and the string, symbol, version, hash and relocation
+    /// tables the dynamic table names. Where one ends the next kind of bytes
+    /// begins, so their ends are where a reader that walks a table stops.
     pub fn loader_tables(&self) -> Vec<(u64, u64)> {
         let fmt = self.fmt;
         let mut ends: Vec<(u64, u64)> = Vec::new();
-        let (phoff, phnum, phentsize, ehsize) = if fmt.is_64 {
-            (
-                le64(self.file, 32).unwrap_or(0),
-                le16(self.file, 56).unwrap_or(0),
-                le16(self.file, 54).unwrap_or(0),
-                le16(self.file, 52).unwrap_or(0),
-            )
-        } else {
-            (
-                u64::from(le32(self.file, 28).unwrap_or(0)),
-                le16(self.file, 44).unwrap_or(0),
-                le16(self.file, 42).unwrap_or(0),
-                le16(self.file, 40).unwrap_or(0),
-            )
-        };
-        if let Some(ph0) = self
-            .phdrs
-            .iter()
-            .find(|ph| ph.kind == PT_LOAD && ph.offset == 0)
-        {
-            let lo = ph0.vaddr;
-            ends.push((lo, lo + u64::from(ehsize)));
-            if phoff < ph0.filesz {
-                let ph = lo + phoff;
-                ends.push((ph, ph + u64::from(phnum) * u64::from(phentsize)));
-            }
-        }
-        for ph in &self.phdrs {
-            if matches!(ph.kind, PT_INTERP | PT_NOTE | PT_PHDR) {
-                ends.push((ph.vaddr, ph.vaddr + ph.memsz));
-            }
+        for ph in self.phdrs.iter().filter(|ph| ph.kind == PT_INTERP) {
+            ends.push((ph.vaddr, ph.vaddr + ph.memsz));
         }
         let tags = self
             .phdrs

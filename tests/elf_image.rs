@@ -244,6 +244,18 @@ fn imports_find_all_three_stub_kinds_and_the_canonical_entry() {
             "version 1 is the base, not a requirement"
         );
 
+        let puts: Vec<_> = img
+            .imports
+            .iter()
+            .filter(|i| i.name == "puts")
+            .map(|i| i.stub)
+            .collect();
+        assert_eq!(
+            puts,
+            [Some(0x610), Some(0x670)],
+            "one import per stub through the slot"
+        );
+        assert_eq!(img.import_name(0x670), Some("puts"));
         assert_eq!(img.import_name(0x610), Some("puts"));
         assert_eq!(img.import_name(PUTS_SLOT), Some("puts"));
         assert_eq!(img.import_name(0x650), Some("free"));
@@ -305,5 +317,16 @@ fn headers_are_the_elf_header_table_and_notes() {
     assert_eq!(
         Image::load(&with_note).unwrap().headers(),
         [(0, 400), (0x3c0, 0x3e0)]
+    );
+    // Two notes that abut are one range.
+    let mut two = with_note.clone();
+    let ph = 64 + 56 * 3; // PT_TLS's slot
+    two[ph..ph + 4].copy_from_slice(&4u32.to_le_bytes());
+    two[ph + 16..ph + 24].copy_from_slice(&0x3e0u64.to_le_bytes());
+    two[ph + 40..ph + 48].copy_from_slice(&0x10u64.to_le_bytes());
+    two[ph + 8..ph + 16].copy_from_slice(&0x3e0u64.to_le_bytes());
+    assert_eq!(
+        Image::load(&two).unwrap().headers(),
+        [(0, 400), (0x3c0, 0x3f0)]
     );
 }

@@ -20,6 +20,7 @@
 //! | `.plt.got`         | 0x640   |
 //! | `.plt.sec` (free)  | 0x650   |
 //! | canonical `qsort`  | 0x660   |
+//! | second `puts` stub | 0x670   |
 //! | `.text`            | 0x700   |
 //! | `.gcc_except_table`| 0x800   |
 //! | `.eh_frame_hdr`    | 0x900   |
@@ -182,6 +183,8 @@ pub fn build(sections: bool) -> Vec<u8> {
         &[0x0f, 0x1f, 0x44, 0, 0],
     ); // .plt.sec
     b.put(0x660, &[0x90; 16]);
+    // A second thunk through the same slot, as a runtime that links per-library stubs has.
+    jmp(&mut b, 0x670, PUTS_SLOT, &[], &[0x90; 10]);
 
     // --- text -------------------------------------------------------------------
     b.put(0x700, &[0xc3; 0x60]);
