@@ -222,9 +222,24 @@ pub struct Import<'a> {
     /// The PLT stub (`.plt`, `.plt.sec`, `.plt.got`) found by scanning
     /// executable memory for `jmp *slot(%rip)`.
     pub stub: Option<u64>,
+    /// Which kind of stub that is; `None` when there is no stub, or when the
+    /// address is a canonical PLT entry (known from `.dynsym` alone).
+    pub stub_kind: Option<StubKind>,
     pub name: &'a str,
     /// The soname the symbol's version requirement (`.gnu.version_r`) names.
     pub library: Option<&'a str>,
+}
+
+/// The kind of a PLT stub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StubKind {
+    /// `.plt` / `.plt.sec`: lazy binding through a `JUMP_SLOT`.
+    Plt,
+    /// `.plt.got`: the stub of an import whose GOT slot is a `GLOB_DAT`
+    /// (a PIE's `__cxa_finalize`, anything under `-z now` that is also
+    /// address-taken).
+    PltGot,
 }
 
 /// The dynamic table, as far as a loader reads it.
@@ -1013,7 +1028,7 @@ impl<'a> Image<'a> {
             }
             got_slots.push((r.offset, r.sym as usize));
         }
-        let mut stubs: Vec<(u64, u64, usize)> = Vec::new(); // (stub, slot, dynsym)
+        let mut stubs: Vec<(u64, u64, usize, StubKind)> = Vec::new(); // (stub, slot, dynsym, kind)
         for seg in self
             .segments
             .iter()
@@ -1035,27 +1050,27 @@ impl<'a> Image<'a> {
                     let va = seg.vaddr + start as u64;
                     if let Some(&sym) = jump_slots.get(&slot) {
                         if va & 15 == 0 {
-                            stubs.push((va, slot, sym));
+                            stubs.push((va, slot, sym, StubKind::Plt));
                         }
                     } else if let Some(&sym) = glob_dat.get(&slot)
                         && va & 7 == 0
                         && matches!(b.get(i + 6..i + 8), Some([0x66, 0x90]) | Some([0x0f, 0x1f]))
                     {
-                        stubs.push((va, slot, sym));
+                        stubs.push((va, slot, sym, StubKind::PltGot));
                     }
                 }
                 i += 1;
             }
         }
-        let mut stub_of: HashMap<u64, u64> = HashMap::new();
-        for &(va, slot, _) in &stubs {
-            stub_of.entry(slot).or_insert(va);
+        let mut stub_of: HashMap<u64, (u64, StubKind)> = HashMap::new();
+        for &(va, slot, _, kind) in &stubs {
+            stub_of.entry(slot).or_insert((va, kind));
         }
 
         // The name of each address, in the order of authority: stubs, GOT
         // slots, then canonical PLT entries.
         let mut names: HashMap<u64, &'a str> = HashMap::new();
-        for &(va, _, sym) in &stubs {
+        for &(va, _, sym, _) in &stubs {
             names.entry(va).or_insert(self.symbols[sym].name);
         }
         let mut imports = Vec::new();
@@ -1064,7 +1079,8 @@ impl<'a> Image<'a> {
             names.entry(slot).or_insert(s.name);
             imports.push(Import {
                 slot: Some(slot),
-                stub: stub_of.get(&slot).copied(),
+                stub: stub_of.get(&slot).map(|s| s.0),
+                stub_kind: stub_of.get(&slot).map(|s| s.1),
                 name: s.name,
                 library: self.symbol_library(sym),
             });
@@ -1075,6 +1091,7 @@ impl<'a> Image<'a> {
                 imports.push(Import {
                     slot: None,
                     stub: Some(s.addr),
+                    stub_kind: None,
                     name: s.name,
                     library: self.symbol_library(idx),
                 });

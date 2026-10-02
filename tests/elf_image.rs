@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use wazabin_binary::image::{Image, RelocKind, SymbolKind, Table};
+use wazabin_binary::image::{Image, RelocKind, StubKind, SymbolKind, Table};
 use wazabin_binary::{LoadError, elf::ElfKind};
 
 #[test]
@@ -230,6 +230,10 @@ fn imports_find_all_three_stub_kinds_and_the_canonical_entry() {
             (find("qsort").slot, find("qsort").stub),
             (None, Some(0x660))
         );
+        assert_eq!(find("puts").stub_kind, Some(StubKind::Plt));
+        assert_eq!(find("free").stub_kind, Some(StubKind::Plt));
+        assert_eq!(find("__cxa_finalize").stub_kind, Some(StubKind::PltGot));
+        assert_eq!(find("qsort").stub_kind, None);
         assert_eq!(find("puts").library, Some("libc.so.6"));
         assert_eq!(find("free").library, Some("libc.so.6"));
         assert_eq!(
