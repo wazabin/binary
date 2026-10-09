@@ -155,3 +155,16 @@ fn elf_binary_keeps_seeds_out_of_its_known_functions() {
     // They never get a name.
     assert_eq!(elf.symbol_name(0x730), None);
 }
+
+/// The unwind tables are located by `PT_GNU_EH_FRAME` and, with section headers, by the names of
+/// `.eh_frame` and `.gcc_except_table`.
+#[test]
+fn unwind_tables_with_and_without_section_headers() {
+    let bytes = build(true);
+    let img = Image::load(&bytes).unwrap();
+    assert_eq!(img.unwind_tables(), vec![(0x800, 0x820), (0x900, 0x924), (0x940, 0x9e0)]);
+    let bytes = build(false);
+    let img = Image::load(&bytes).unwrap();
+    let hdr: Vec<(u64, u64)> = img.eh_frame_hdr().map(|(a, n)| (a, a + n)).into_iter().collect();
+    assert_eq!(img.unwind_tables(), hdr, "without section headers, only the header the program headers name");
+}

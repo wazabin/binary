@@ -1463,6 +1463,24 @@ impl<'a> Image<'a> {
         self.eh_hdr
     }
 
+    /// The `(start, end)` of the unwind tables the image maps: `.eh_frame_hdr`
+    /// ([`Image::eh_frame_hdr`]), and `.eh_frame` and `.gcc_except_table` when
+    /// the file has section headers (nothing else locates them). Like
+    /// [`Image::loader_tables`], they are not program data: a reader looking for
+    /// code pointers in data skips them (their pc-relative entries, read as
+    /// words, look like addresses by chance).
+    pub fn unwind_tables(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = self.eh_hdr.map(|(a, n)| (a, a + n)).into_iter().collect();
+        for name in [".eh_frame", ".gcc_except_table"] {
+            if let Some(s) = self.section(name).filter(|s| s.size > 0) {
+                out.push((s.addr, s.addr + s.size));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Function starts the file's metadata names, apart from its symbols:
     /// the `.eh_frame` FDE starts (nameless, but they survive `strip`) and
     /// the constructor / destructor entry points the loader reaches through
