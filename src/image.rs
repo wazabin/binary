@@ -858,7 +858,10 @@ impl<'a> Image<'a> {
 
     /// How many entries `DT_SYMTAB` has: from `DT_GNU_HASH` (the highest
     /// chained index), else `DT_HASH`'s `nchain`, else what fits before
-    /// `DT_STRTAB`.
+    /// `DT_STRTAB`. A GNU hash table that chains no symbol (an executable that
+    /// only imports) says nothing of the undefined symbols, which may follow
+    /// its `symoffset`: the dynamic relocations name them, so there are at
+    /// least as many as the highest index they name, plus one.
     fn dynsym_entries(&self, tags: &[(i64, u64)]) -> usize {
         let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
         let symtab = tag(DT_SYMTAB).unwrap_or(0);
@@ -894,7 +897,7 @@ impl<'a> Image<'a> {
             if max > 0 {
                 return max as usize + 1;
             }
-            return symoff as usize;
+            return (symoff as usize).max(self.reloc_symbols(tags));
         }
         if let Some(h) = tag(DT_HASH)
             && let Some(b) = self.bytes_from(h)
@@ -909,6 +912,20 @@ impl<'a> Image<'a> {
             Some(st) if st > symtab => ((st - symtab) / ent) as usize,
             _ => 0,
         }
+    }
+
+    /// One past the highest symbol index the dynamic relocations name.
+    fn reloc_symbols(&self, tags: &[(i64, u64)]) -> usize {
+        let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
+        let mut relocs = Vec::new();
+        for (a, n, rela) in [(DT_RELA, DT_RELASZ, true), (DT_JMPREL, DT_PLTRELSZ, self.fmt.is_64), (DT_REL, DT_RELSZ, false)] {
+            if let (Some(a), Some(n)) = (tag(a), tag(n))
+                && let Some(b) = self.read(a, n as usize)
+            {
+                self.read_relocs(b, rela, &mut relocs);
+            }
+        }
+        relocs.iter().map(|r| r.sym as usize + 1).max().unwrap_or(0)
     }
 
     fn read_symbols(

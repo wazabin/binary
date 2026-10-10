@@ -43,6 +43,11 @@ fn segments_entry_and_stubs_are_consistent() {
     assert!(seg.sections.is_empty());
     assert_eq!(seg.segments, img.segments);
     assert_eq!(seg.dynamic.needed, img.dynamic.needed);
+    // ... and names every relocation's symbol (the count of `.dynsym` comes from the hash tables and the
+    // relocations then, not the section).
+    for r in &img.relocs {
+        assert_eq!(seg.reloc_symbol(r).map(|s| s.name), img.reloc_symbol(r).map(|s| s.name), "relocation at {:#x}", r.offset);
+    }
     assert_eq!(seg.dynsyms(), img.dynsyms());
     assert_eq!(seg.relocs.len(), img.relocs.len());
     assert_eq!(seg.imports.len(), img.imports.len());
