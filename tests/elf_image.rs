@@ -348,3 +348,105 @@ fn gnu_hash_symbol_count_reads_one_chain() {
     // As many as `.dynsym` holds before its bytes run out.
     assert!(count > 8, "{count}");
 }
+
+#[test]
+fn an_import_only_gnu_hash_counts_the_symbols_the_relocations_name() {
+    // An executable that only imports: `symoffset` 1 and no bucket chains a
+    // symbol. Its seven imports follow the offset, and the relocations name
+    // them all.
+    let bytes = with_gnu_hash(1, &[0], &[]);
+    let img = Image::load_segments(&bytes).unwrap();
+    let full = build(false);
+    let with_hash = Image::load_segments(&full).unwrap();
+    assert_eq!(img.dynsyms().len(), 8);
+    assert_eq!(img.dynsyms(), with_hash.dynsyms());
+    for r in &img.relocs {
+        assert_eq!(
+            img.reloc_symbol(r).map(|s| s.name),
+            with_hash.reloc_symbol(r).map(|s| s.name),
+            "relocation at {:#x}",
+            r.offset
+        );
+    }
+    assert_eq!(img.imports, with_hash.imports);
+}
+
+/// An x32 executable (ELF32, x86-64): two `JUMP_SLOT`s in a `DT_JMPREL`
+/// table that `DT_PLTREL` says is RELA.
+fn x32() -> Vec<u8> {
+    let mut b = Buf(vec![0u8; 0x400]);
+    b.put(0, b"\x7fELF");
+    b.put(4, &[1, 1, 1]);
+    b.u16(16, 2); // ET_EXEC
+    b.u16(18, 62);
+    b.u32(20, 1);
+    b.u32(28, 52); // e_phoff
+    b.u16(40, 52);
+    b.u16(42, 32);
+    b.u16(44, 2);
+    // PT_LOAD (RW) over the whole file, PT_DYNAMIC at 0x300.
+    for (i, (kind, off, size, flags)) in [(1u32, 0u32, 0x400u32, 6u32), (2, 0x300, 0x40, 6)]
+        .into_iter()
+        .enumerate()
+    {
+        let at = 52 + 32 * i;
+        b.u32(at, kind);
+        b.u32(at + 4, off);
+        b.u32(at + 8, off);
+        b.u32(at + 12, off);
+        b.u32(at + 16, size);
+        b.u32(at + 20, size);
+        b.u32(at + 24, flags);
+        b.u32(at + 28, 4);
+    }
+    // .dynsym: null, f, g (global FUNC, undefined); .dynstr.
+    for (i, name) in [1u32, 3].into_iter().enumerate() {
+        let at = 0x100 + 16 * (i + 1);
+        b.u32(at, name);
+        b.put(at + 12, &[0x12]);
+    }
+    b.put(0x180, b"\0f\0g\0");
+    // .rela.plt: (r_offset, r_info = sym << 8 | R_X86_64_JUMP_SLOT, r_addend).
+    for (i, (slot, sym)) in [(0x3f0u32, 1u32), (0x3f4, 2)].into_iter().enumerate() {
+        let at = 0x200 + 12 * i;
+        b.u32(at, slot);
+        b.u32(at + 4, sym << 8 | 7);
+        b.u32(at + 8, 0);
+    }
+    let dynamic: [(u32, u32); 8] = [
+        (6, 0x100),  // DT_SYMTAB
+        (5, 0x180),  // DT_STRTAB
+        (10, 5),     // DT_STRSZ
+        (11, 16),    // DT_SYMENT
+        (23, 0x200), // DT_JMPREL
+        (2, 24),     // DT_PLTRELSZ
+        (20, 7),     // DT_PLTREL = DT_RELA
+        (0, 0),
+    ];
+    for (i, (t, v)) in dynamic.into_iter().enumerate() {
+        b.u32(0x300 + 8 * i, t);
+        b.u32(0x300 + 8 * i + 4, v);
+    }
+    b.0
+}
+
+#[test]
+fn the_plt_relocations_are_rela_or_rel_as_dt_pltrel_says() {
+    let bytes = x32();
+    let img = Image::load(&bytes).unwrap();
+    assert!(!img.is_64());
+    let relocs: Vec<_> = img
+        .relocs
+        .iter()
+        .map(|r| (r.offset, r.kind, r.sym, r.addend))
+        .collect();
+    assert_eq!(
+        relocs,
+        [
+            (0x3f0, RelocKind::JumpSlot, 1, 0),
+            (0x3f4, RelocKind::JumpSlot, 2, 0)
+        ]
+    );
+    let names: Vec<_> = img.imports.iter().map(|i| i.name).collect();
+    assert_eq!(names, ["f", "g"]);
+}

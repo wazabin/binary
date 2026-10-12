@@ -43,6 +43,7 @@ const SHF_ALLOC: u64 = 2;
 
 const DT_NEEDED: i64 = 1;
 const DT_PLTRELSZ: i64 = 2;
+const DT_PLTREL: i64 = 20;
 const DT_HASH: i64 = 4;
 const DT_PLTGOT: i64 = 3;
 const DT_STRTAB: i64 = 5;
@@ -694,6 +695,50 @@ impl<'a> Image<'a> {
             .unwrap_or_default();
         let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
 
+        // --- relocations -----------------------------------------------------
+        let mut ranges: Vec<(u64, u64, bool)> = Vec::new();
+        let mut plt_range = None;
+        if let (Some(a), Some(n)) = (tag(DT_RELA), tag(DT_RELASZ)) {
+            ranges.push((a, n, true));
+        }
+        if let (Some(a), Some(n)) = (tag(DT_JMPREL), tag(DT_PLTRELSZ)) {
+            // `DT_PLTREL` says RELA or REL (x32 is ELF32 with RELA); without
+            // it, the file's class (x86-64 RELA, i386 REL).
+            let rela = tag(DT_PLTREL).map_or(fmt.is_64, |t| t == DT_RELA as u64);
+            plt_range = Some(ranges.len());
+            ranges.push((a, n, rela));
+        }
+        if let (Some(a), Some(n)) = (tag(DT_REL), tag(DT_RELSZ)) {
+            ranges.push((a, n, false));
+        }
+        let mut relocs = Vec::new();
+        let mut plt_relocs = 0..0;
+        for (k, &(a, n, rela)) in ranges.iter().enumerate() {
+            let before = relocs.len();
+            if let Some(b) = img.read(a, n as usize) {
+                img.read_relocs(b, rela, &mut relocs);
+            }
+            if Some(k) == plt_range {
+                plt_relocs = before..relocs.len();
+            }
+        }
+        // The dynamic relocations name `.dynsym` entries the hash tables may
+        // not count (see `dynsym_entries`).
+        let reloc_symbols = relocs.iter().map(|r| r.sym as usize + 1).max().unwrap_or(0);
+        // Allocated relocation sections no tag covers (a static executable's
+        // `.rela.plt` of IRELATIVE entries).
+        for s in shdrs.iter().filter(|s| {
+            matches!(s.kind, SHT_RELA | SHT_REL) && s.flags & SHF_ALLOC != 0 && s.addr != 0
+        }) {
+            let covered = ranges.iter().any(|&(a, n, _)| {
+                s.addr >= a && s.addr.saturating_add(s.size) <= a.saturating_add(n)
+            });
+            if !covered {
+                img.read_relocs(sec_bytes(s), s.kind == SHT_RELA, &mut relocs);
+            }
+        }
+        img.relocs = relocs;
+
         // --- symbols ---------------------------------------------------------
         let dynsym_sec = shdrs.iter().find(|s| s.kind == SHT_DYNSYM);
         let mut symbols = Vec::new();
@@ -706,7 +751,7 @@ impl<'a> Image<'a> {
                 .read(strtab, strsz as usize)
                 .or_else(|| img.bytes_from(strtab))
                 .unwrap_or(&[]);
-            let n = img.dynsym_entries(&tags);
+            let n = img.dynsym_entries(&tags, reloc_symbols);
             let b = img.bytes_from(symtab).unwrap_or(&[]);
             img.read_symbols(
                 &b[..b.len().min(n.saturating_mul(fmt.sym_size()))],
@@ -795,46 +840,6 @@ impl<'a> Image<'a> {
             img.version_needs = needs;
         }
 
-        // --- relocations -----------------------------------------------------
-        let mut ranges: Vec<(u64, u64, bool)> = Vec::new();
-        let mut plt_range = None;
-        if let (Some(a), Some(n)) = (tag(DT_RELA), tag(DT_RELASZ)) {
-            ranges.push((a, n, true));
-        }
-        if let (Some(a), Some(n)) = (tag(DT_JMPREL), tag(DT_PLTRELSZ)) {
-            // `DT_PLTREL` says RELA or REL; the file's class decides which in
-            // every layout this crate reads (x86-64 RELA, i386 REL).
-            plt_range = Some(ranges.len());
-            ranges.push((a, n, fmt.is_64));
-        }
-        if let (Some(a), Some(n)) = (tag(DT_REL), tag(DT_RELSZ)) {
-            ranges.push((a, n, false));
-        }
-        let mut relocs = Vec::new();
-        let mut plt_relocs = 0..0;
-        for (k, &(a, n, rela)) in ranges.iter().enumerate() {
-            let before = relocs.len();
-            if let Some(b) = img.read(a, n as usize) {
-                img.read_relocs(b, rela, &mut relocs);
-            }
-            if Some(k) == plt_range {
-                plt_relocs = before..relocs.len();
-            }
-        }
-        // Allocated relocation sections no tag covers (a static executable's
-        // `.rela.plt` of IRELATIVE entries).
-        for s in shdrs.iter().filter(|s| {
-            matches!(s.kind, SHT_RELA | SHT_REL) && s.flags & SHF_ALLOC != 0 && s.addr != 0
-        }) {
-            let covered = ranges.iter().any(|&(a, n, _)| {
-                s.addr >= a && s.addr.saturating_add(s.size) <= a.saturating_add(n)
-            });
-            if !covered {
-                img.read_relocs(sec_bytes(s), s.kind == SHT_RELA, &mut relocs);
-            }
-        }
-        img.relocs = relocs;
-
         img.build_imports(plt_relocs);
         Ok(img)
     }
@@ -869,8 +874,9 @@ impl<'a> Image<'a> {
     /// `DT_STRTAB`. A GNU hash table that chains no symbol (an executable that
     /// only imports) says nothing of the undefined symbols, which may follow
     /// its `symoffset`: the dynamic relocations name them, so there are at
-    /// least as many as the highest index they name, plus one.
-    fn dynsym_entries(&self, tags: &[(i64, u64)]) -> usize {
+    /// least as many as the highest index they name, plus one
+    /// (`reloc_symbols`).
+    fn dynsym_entries(&self, tags: &[(i64, u64)], reloc_symbols: usize) -> usize {
         let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
         let symtab = tag(DT_SYMTAB).unwrap_or(0);
         if let Some(gh) = tag(DT_GNU_HASH)
@@ -911,7 +917,7 @@ impl<'a> Image<'a> {
                 }
                 return idx as usize + 1;
             }
-            return (symoff as usize).max(self.reloc_symbols(tags));
+            return (symoff as usize).max(reloc_symbols);
         }
         if let Some(h) = tag(DT_HASH)
             && let Some(b) = self.bytes_from(h)
@@ -926,24 +932,6 @@ impl<'a> Image<'a> {
             Some(st) if st > symtab => ((st - symtab) / ent) as usize,
             _ => 0,
         }
-    }
-
-    /// One past the highest symbol index the dynamic relocations name.
-    fn reloc_symbols(&self, tags: &[(i64, u64)]) -> usize {
-        let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
-        let mut relocs = Vec::new();
-        for (a, n, rela) in [
-            (DT_RELA, DT_RELASZ, true),
-            (DT_JMPREL, DT_PLTRELSZ, self.fmt.is_64),
-            (DT_REL, DT_RELSZ, false),
-        ] {
-            if let (Some(a), Some(n)) = (tag(a), tag(n))
-                && let Some(b) = self.read(a, n as usize)
-            {
-                self.read_relocs(b, rela, &mut relocs);
-            }
-        }
-        relocs.iter().map(|r| r.sym as usize + 1).max().unwrap_or(0)
     }
 
     fn read_symbols(
