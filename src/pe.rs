@@ -171,12 +171,18 @@ impl PeBinary {
                 let start = pe
                     .image_base
                     .checked_add(u64::from(section.virtual_address))?;
-                let mem_size = u64::from(section.virtual_size.max(section.size_of_raw_data));
+                // The section is `VirtualSize` bytes in memory; raw data past
+                // it is file-alignment padding the loader does not map. A
+                // `VirtualSize` of 0 (old linkers) means the raw size.
+                let mem_size = u64::from(match section.virtual_size {
+                    0 => section.size_of_raw_data,
+                    v => v,
+                });
                 // A section that would run past the top of the address space
                 // is not mapped.
                 start.checked_add(mem_size)?;
                 let offset = section.pointer_to_raw_data as usize;
-                let filesz = section.size_of_raw_data as usize;
+                let filesz = section.size_of_raw_data.min(mem_size as u32) as usize;
                 let data = file_bytes
                     .get(offset..offset.saturating_add(filesz))
                     .unwrap_or(&[])
@@ -863,6 +869,24 @@ mod tests {
         let file_backed = pe.sections[0].data.len();
         assert!(regions[0].1.len() - file_backed <= crate::ZERO_FILL_LIMIT as usize);
         assert_eq!(regions[0].1[..2], [0xff, 0x25]);
+    }
+
+    #[test]
+    fn a_section_is_its_virtual_size_in_memory() {
+        // `.text`: VirtualSize 0x10 of a 0x200-byte raw block.
+        let pe = PeBinary::parse(&pe_image(true, &[])).unwrap();
+        assert_eq!(pe.sections()[0].size, 0x10);
+        assert_eq!(pe.segment_bounds(0x40_1000), Some((0x40_1000, 0x40_1010)));
+        assert!(pe.is_executable(0x40_100f));
+        assert!(!pe.is_executable(0x40_1010), "file alignment padding");
+        assert_eq!(pe.byte_at(0x40_1010), None);
+        assert_eq!(pe.mapped_regions()[0].1.len(), 0x10);
+        // A VirtualSize of 0 stands for the raw size.
+        let mut b = pe_image(true, &[]);
+        let virtual_size = 0x40 + 4 + 20 + 240 + 8;
+        b[virtual_size..virtual_size + 4].fill(0);
+        let pe = PeBinary::parse(&b).unwrap();
+        assert_eq!(pe.sections()[0].size, 0x200);
     }
 
     #[test]
