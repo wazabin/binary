@@ -167,7 +167,7 @@ fn parse_raw(b: &[u8], at: u64, ptr_size: usize) -> Option<RawLsda<'_>> {
     let mut tt_base = 0u64;
     if tt_enc != OMIT {
         let tt_off = c.uleb()?;
-        tt_base = c.addr() + tt_off;
+        tt_base = c.addr().wrapping_add(tt_off);
     }
     let cs_enc = c.u8()?;
     let cs_len = c.uleb()? as usize;
@@ -213,7 +213,7 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
         if sz == 0 {
             return None;
         }
-        let at = tt_base.wrapping_sub(sz as u64 * i as u64);
+        let at = tt_base.wrapping_sub((sz as u64).checked_mul(i as u64)?);
         let b = img.read(at, sz)?;
         let mut cc = Cursor::new(b, at);
         cc.ptr_size = ptr_size;
@@ -224,8 +224,9 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
         rs.ptr(tt_enc, v)
     };
     let spec_at = |i: i64| -> Option<Vec<Ptr>> {
-        // The list of type indices, uleb, 0-terminated, at tt_base + (-i - 1).
-        let at = tt_base.wrapping_add((-i - 1) as u64);
+        // The list of type indices, uleb, 0-terminated, at tt_base + (-i - 1)
+        // (`!i`, which `i64::MIN` does not overflow).
+        let at = tt_base.wrapping_add(!i as u64);
         let left = (seg_end as usize).saturating_sub(at as usize);
         let b = img.read(at, 64.min(left))?;
         let mut cc = Cursor::new(b, at);
@@ -246,7 +247,10 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
             if a == 0 {
                 clauses.push(Clause::Cleanup);
             } else {
-                let mut p = raw.actions + a as usize - 1;
+                // `a` is 1-based.
+                let mut p = usize::try_from(a - 1)
+                    .ok()
+                    .and_then(|a| raw.actions.checked_add(a))?;
                 for _ in 0..256 {
                     let mut ac = Cursor::new(raw.b, raw.at);
                     ac.p = p;
@@ -269,7 +273,7 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
                     if next == 0 {
                         break;
                     }
-                    p = (next_at as i64 + next) as usize;
+                    p = usize::try_from((next_at as i64).checked_add(next)?).ok()?;
                 }
             }
         }

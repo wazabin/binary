@@ -218,39 +218,50 @@ pub(crate) fn header_offset(bytes: &[u8]) -> Option<(usize, [u8; 2])> {
         return None;
     }
     let at = u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?) as usize;
-    let sig: [u8; 2] = bytes.get(at..at + 2)?.try_into().ok()?;
+    let sig: [u8; 2] = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
     matches!(&sig, b"LE" | b"LX").then_some((at, sig))
 }
 
 /// Little-endian reads that fail with the name of what was being read.
+///
+/// File offsets are computed with saturating arithmetic: an offset that
+/// saturates lies past the end of any file, so the read fails as truncated.
 struct Reader<'a> {
     bytes: &'a [u8],
 }
 
 impl Reader<'_> {
+    fn get(&self, at: usize, n: usize, what: &'static str) -> Result<&[u8], LeError> {
+        at.checked_add(n)
+            .and_then(|end| self.bytes.get(at..end))
+            .ok_or(LeError::Truncated(what))
+    }
+
     fn u8(&self, at: usize, what: &'static str) -> Result<u8, LeError> {
         self.bytes.get(at).copied().ok_or(LeError::Truncated(what))
     }
 
     fn u16(&self, at: usize, what: &'static str) -> Result<u16, LeError> {
-        let b = self.bytes.get(at..at + 2).ok_or(LeError::Truncated(what))?;
+        let b = self.get(at, 2, what)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     fn u32(&self, at: usize, what: &'static str) -> Result<u32, LeError> {
-        let b = self.bytes.get(at..at + 4).ok_or(LeError::Truncated(what))?;
+        let b = self.get(at, 4, what)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// A length-prefixed string, as the name tables store them.
     fn pstr(&self, at: usize, what: &'static str) -> Result<String, LeError> {
         let len = self.u8(at, what)? as usize;
-        let b = self
-            .bytes
-            .get(at + 1..at + 1 + len)
-            .ok_or(LeError::Truncated(what))?;
+        let b = self.get(at.saturating_add(1), len, what)?;
         Ok(String::from_utf8_lossy(b).into_owned())
     }
+}
+
+/// `base + offset` for a file offset (see [`Reader`]).
+fn file_offset(base: usize, offset: u32) -> usize {
+    base.saturating_add(offset as usize)
 }
 
 impl LeBinary {
@@ -260,9 +271,9 @@ impl LeBinary {
             return Err(LeError::Lx);
         }
         let r = Reader { bytes };
-        let h8 = |off: usize| r.u8(le + off, "header");
-        let h16 = |off: usize| r.u16(le + off, "header");
-        let h32 = |off: usize| r.u32(le + off, "header");
+        let h8 = |off: usize| r.u8(le.saturating_add(off), "header");
+        let h16 = |off: usize| r.u16(le.saturating_add(off), "header");
+        let h32 = |off: usize| r.u32(le.saturating_add(off), "header");
         if h8(0x02)? != 0 || h8(0x03)? != 0 {
             return Err(LeError::BigEndian);
         }
@@ -270,20 +281,20 @@ impl LeBinary {
         let module_pages = h32(0x14)?;
         let page_size = h32(0x28)?;
         let last_page_size = h32(0x2c)?;
-        let object_table = le + h32(0x40)? as usize;
+        let object_table = file_offset(le, h32(0x40)?);
         let object_count = h32(0x44)?;
-        let page_map = le + h32(0x48)? as usize;
+        let page_map = file_offset(le, h32(0x48)?);
         let resident_names = h32(0x58)?;
-        let fixup_pages = le + h32(0x68)? as usize;
-        let fixup_records = le + h32(0x6c)? as usize;
-        let import_module_table = le + h32(0x70)? as usize;
+        let fixup_pages = file_offset(le, h32(0x68)?);
+        let fixup_records = file_offset(le, h32(0x6c)?);
+        let import_module_table = file_offset(le, h32(0x70)?);
         let import_module_count = h32(0x74)?;
-        let import_procs = le + h32(0x78)? as usize;
+        let import_procs = file_offset(le, h32(0x78)?);
         // The one offset in the header that counts from the start of the file.
         let data_pages = h32(0x80)? as usize;
 
         let module_name = if resident_names != 0 {
-            Some(r.pstr(le + resident_names as usize, "resident name table")?)
+            Some(r.pstr(file_offset(le, resident_names), "resident name table")?)
                 .filter(|n| !n.is_empty())
         } else {
             None
@@ -293,7 +304,7 @@ impl LeBinary {
         let mut at = import_module_table;
         for _ in 0..import_module_count {
             let name = r.pstr(at, "import module table")?;
-            at += 1 + name.len();
+            at = at.saturating_add(1 + name.len());
             import_modules.push(name);
         }
 
@@ -302,23 +313,29 @@ impl LeBinary {
         let mut objects = Vec::new();
         let mut pages: Vec<(u32, u64)> = Vec::new(); // (logical page, linear address)
         for i in 0..object_count {
-            let e = object_table + 24 * i as usize;
+            let e = object_table.saturating_add((i as usize).saturating_mul(24));
             let virtual_size = r.u32(e, "object table")? as u64;
-            let base = r.u32(e + 4, "object table")? as u64;
-            let flags = r.u32(e + 8, "object table")?;
-            let first_page = r.u32(e + 12, "object table")?;
-            let page_count = r.u32(e + 16, "object table")?;
+            let base = r.u32(e.saturating_add(4), "object table")? as u64;
+            let flags = r.u32(e.saturating_add(8), "object table")?;
+            let first_page = r.u32(e.saturating_add(12), "object table")?;
+            let page_count = r.u32(e.saturating_add(16), "object table")?;
 
             let mut data = Vec::new();
             for j in 0..page_count {
-                let logical = first_page + j;
-                let pm = page_map + 4 * (logical as usize - 1);
+                // Logical pages are 1-based indices into the page map.
+                let logical = first_page
+                    .checked_add(j)
+                    .filter(|&l| l != 0)
+                    .ok_or(LeError::Truncated("page map"))?;
+                let pm = page_map.saturating_add((logical as usize - 1).saturating_mul(4));
                 // LE page-map entry: a 24-bit big-endian page number, then a type.
-                let number = (r.u8(pm, "page map")? as u32) << 16
-                    | (r.u8(pm + 1, "page map")? as u32) << 8
-                    | r.u8(pm + 2, "page map")? as u32;
-                let kind = r.u8(pm + 3, "page map")?;
-                data.resize((j * page_size) as usize, 0);
+                let entry = r.get(pm, 4, "page map")?;
+                let number = u32::from_be_bytes([0, entry[0], entry[1], entry[2]]);
+                let kind = entry[3];
+                // Offsets within the object, in u64: `j * page_size` is up
+                // to 64 bits wide.
+                let offset = u64::from(j) * u64::from(page_size);
+                data.resize(offset as usize, 0);
                 match kind {
                     0 => {
                         let size = if number == module_pages {
@@ -326,14 +343,15 @@ impl LeBinary {
                         } else {
                             page_size
                         };
-                        let start = data_pages + (number as usize - 1) * page_size as usize;
-                        let page = bytes
-                            .get(start..start + size as usize)
-                            .ok_or(LeError::Truncated("page"))?;
-                        data.extend_from_slice(page);
+                        // Physical pages are 1-based too.
+                        let physical = number.checked_sub(1).ok_or(LeError::Truncated("page"))?;
+                        let start = u64::from(physical) * u64::from(page_size);
+                        let start = usize::try_from(start)
+                            .map_or(usize::MAX, |s| data_pages.saturating_add(s));
+                        data.extend_from_slice(r.get(start, size as usize, "page")?);
                     }
                     // Zero-filled (3) and invalid (2) pages read as zeros.
-                    2 | 3 => data.resize(((j + 1) * page_size) as usize, 0),
+                    2 | 3 => data.resize((offset + u64::from(page_size)) as usize, 0),
                     flags => {
                         return Err(LeError::UnsupportedPage {
                             page: logical,
@@ -341,7 +359,7 @@ impl LeBinary {
                         });
                     }
                 }
-                pages.push((logical, base + (j * page_size) as u64));
+                pages.push((logical, base + offset));
             }
             data.truncate(virtual_size as usize);
             objects.push(LeObject {
@@ -355,9 +373,12 @@ impl LeBinary {
 
         let mut fixups = Vec::new();
         for &(logical, page_va) in &pages {
-            let slot = fixup_pages + 4 * (logical as usize - 1);
-            let start = fixup_records + r.u32(slot, "fixup page table")? as usize;
-            let end = fixup_records + r.u32(slot + 4, "fixup page table")? as usize;
+            let slot = fixup_pages.saturating_add((logical as usize - 1).saturating_mul(4));
+            let start = file_offset(fixup_records, r.u32(slot, "fixup page table")?);
+            let end = file_offset(
+                fixup_records,
+                r.u32(slot.saturating_add(4), "fixup page table")?,
+            );
             let mut at = start;
             while at < end {
                 at = parse_fixup(&r, at, page_va, import_procs, &mut fixups)?;
@@ -552,8 +573,11 @@ fn parse_fixup(
         }
         2 => {
             let module = read_object(&mut p)?;
-            let name_at = read_offset(&mut p)? as usize;
-            let name = r.pstr(import_procs + name_at, "import procedure name table")?;
+            let name_at = read_offset(&mut p)?;
+            let name = r.pstr(
+                file_offset(import_procs, name_at),
+                "import procedure name table",
+            )?;
             let additive = read_additive(&mut p)?;
             LeFixupTarget::ImportName {
                 module,
@@ -839,6 +863,80 @@ mod tests {
         assert!(!b.is_known_read_only(0x10000));
         let names: Vec<_> = b.sections().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["object1", "object2"]);
+    }
+
+    /// `sample` with the object-table field at `field` of object `object`
+    /// (0-based) set to `value`.
+    fn with_object_field(object: usize, field: usize, value: u32) -> Vec<u8> {
+        let mut f = sample();
+        let at = 0x40 + 0xc4 + 24 * object + field;
+        f[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        f
+    }
+
+    /// Everything `parse` computes, and the queries that read its objects.
+    fn exercise(bytes: &[u8]) {
+        if let Ok(b) = LeBinary::parse(bytes) {
+            let _ = b.bits();
+            let _ = b.sections();
+            for f in &b.fixups {
+                let _ = b.fixup_target(f);
+                let _ = b.byte_at(f.address);
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_numbered_zero_or_past_u32_is_an_error() {
+        // Logical pages are 1-based: 0 is no page.
+        assert!(LeBinary::parse(&with_object_field(0, 12, 0)).is_err());
+        // A run of pages that counts past u32::MAX.
+        let mut f = with_object_field(0, 12, u32::MAX);
+        f[0x40 + 0xc4 + 16..0x40 + 0xc4 + 20].copy_from_slice(&2u32.to_le_bytes());
+        assert!(LeBinary::parse(&f).is_err());
+        // A physical page numbered 0 in the page map.
+        let mut f = sample();
+        f[0x40 + 0xf4..0x40 + 0xf8].copy_from_slice(&[0, 0, 0, 0]);
+        assert!(LeBinary::parse(&f).is_err());
+    }
+
+    #[test]
+    fn huge_page_and_object_values_are_not_arithmetic() {
+        let page_size = 0x40 + 0x28;
+        for v in [0x8000_0000u32, u32::MAX] {
+            let mut f = sample();
+            f[page_size..page_size + 4].copy_from_slice(&v.to_le_bytes());
+            exercise(&f);
+        }
+        for (field, v) in [(4, u32::MAX), (0, u32::MAX), (16, u32::MAX)] {
+            exercise(&with_object_field(1, field, v));
+        }
+    }
+
+    #[test]
+    fn truncated_and_mutated_images_never_panic() {
+        let base = sample();
+        for len in 0..base.len() {
+            exercise(&base[..len]);
+        }
+        // The header and its tables; the pages are data.
+        for at in 0..0x200.min(base.len()) {
+            for v in [
+                0u32,
+                1,
+                0x7fff,
+                0x8000,
+                0xffff,
+                0x7fff_ffff,
+                0x8000_0000,
+                u32::MAX,
+            ] {
+                let mut f = base.clone();
+                let n = 4.min(f.len() - at);
+                f[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
+                exercise(&f);
+            }
+        }
     }
 
     #[test]

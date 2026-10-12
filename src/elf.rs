@@ -155,7 +155,7 @@ pub struct TlsSegment {
 
 impl LoadSegment {
     fn end(&self) -> u64 {
-        self.start + self.mem_size
+        self.start.saturating_add(self.mem_size)
     }
 
     fn contains(&self, addr: u64) -> bool {
@@ -238,7 +238,8 @@ pub enum ElfError {
     UnknownArch,
     /// A header or table lies outside the file.
     Truncated(&'static str),
-    /// A `PT_LOAD` segment's file bytes lie outside the file (its `vaddr`).
+    /// A `PT_LOAD` segment's file bytes lie outside the file, or its memory
+    /// image runs past the top of the address space (its `vaddr`).
     SegmentOutOfBounds(u64),
     /// An ELF flavour [`image::Image`](crate::image::Image) does not read
     /// (big-endian, an unknown class).
@@ -253,7 +254,10 @@ impl std::fmt::Display for ElfError {
             ElfError::UnknownArch => write!(f, "ELF has an unknown arch"),
             ElfError::Truncated(what) => write!(f, "ELF {what} lie outside the file"),
             ElfError::SegmentOutOfBounds(vaddr) => {
-                write!(f, "PT_LOAD at {vaddr:#x}: file range out of bounds")
+                write!(
+                    f,
+                    "PT_LOAD at {vaddr:#x}: file or memory range out of bounds"
+                )
             }
             ElfError::Unsupported(what) => write!(f, "unsupported ELF: {what}"),
         }
@@ -280,26 +284,31 @@ impl ElfBinary {
         // --- Load the first PT_LOAD segment ---------------------------------
         let segments = elf.segments().ok_or(ElfError::NoLoadableSegment)?;
 
-        let mut load_segments: Vec<_> = segments
+        let mut load_segments = Vec::new();
+        for p in segments
             .iter()
             .filter(|p| p.p_type == PT_LOAD && p.p_memsz > 0)
-            .map(|p| {
-                let offset = p.p_offset as usize;
-                let filesz = p.p_filesz as usize;
-                let data = file_bytes
-                    .get(offset..offset + filesz)
-                    .unwrap_or(&[])
-                    .to_vec();
-                LoadSegment {
-                    start: p.p_vaddr,
-                    mem_size: p.p_memsz,
-                    data,
-                    executable: p.p_flags & PF_X != 0,
-                    writable: p.p_flags & PF_W != 0,
-                    align: p.p_align,
-                }
-            })
-            .collect();
+        {
+            // A segment that wraps past the top of the address space is no
+            // memory image at all.
+            if p.p_vaddr.checked_add(p.p_memsz).is_none() {
+                return Err(ElfError::SegmentOutOfBounds(p.p_vaddr));
+            }
+            let data = usize::try_from(p.p_offset)
+                .ok()
+                .zip(usize::try_from(p.p_filesz).ok())
+                .and_then(|(offset, filesz)| file_bytes.get(offset..offset.checked_add(filesz)?))
+                .unwrap_or(&[])
+                .to_vec();
+            load_segments.push(LoadSegment {
+                start: p.p_vaddr,
+                mem_size: p.p_memsz,
+                data,
+                executable: p.p_flags & PF_X != 0,
+                writable: p.p_flags & PF_W != 0,
+                align: p.p_align,
+            });
+        }
 
         if load_segments.is_empty() {
             return Err(ElfError::NoLoadableSegment);
@@ -354,8 +363,8 @@ impl ElfBinary {
                 segments
                     .iter()
                     .filter(|p| p.p_type == PT_LOAD)
-                    .find(|p| phoff >= p.p_offset && phoff < p.p_offset + p.p_filesz)
-                    .map(|p| p.p_vaddr + (phoff - p.p_offset))
+                    .find(|p| phoff >= p.p_offset && phoff - p.p_offset < p.p_filesz)
+                    .and_then(|p| p.p_vaddr.checked_add(phoff - p.p_offset))
             });
         let program_headers = ProgramHeaderTable {
             offset: phoff,
@@ -586,15 +595,19 @@ fn collect_plt_symbols_inner(
 
     for (i, name, library) in import_relocs {
         // `.plt` stub for relocation `i` sits after the reserved entry 0.
-        let plt_stub_addr = plt_start + ((i + 1) as u64) * plt_entry_size;
-        match plt_sec_start {
+        let stub =
+            |start: u64, n: usize| start.checked_add((n as u64).checked_mul(plt_entry_size)?);
+        let Some(plt_stub_addr) = stub(plt_start, i + 1) else {
+            continue;
+        };
+        match plt_sec_start.map(|s| stub(s, i)) {
             // With a `.plt.sec`, that stub bears the import name (callers target
             // it); the `.plt` stub stays external but nameless, so it is not
             // mistaken for a pure local — and so its name does not collide with
             // the `.plt.sec` stub's.
-            Some(sec_start) => {
+            Some(Some(sec_stub)) => {
                 out.push(FunctionSymbol {
-                    address: sec_start + (i as u64) * plt_entry_size,
+                    address: sec_stub,
                     name,
                     size: None,
                     is_external: true,
@@ -608,6 +621,7 @@ fn collect_plt_symbols_inner(
                     library,
                 });
             }
+            Some(None) => {}
             None => out.push(FunctionSymbol {
                 address: plt_stub_addr,
                 name,

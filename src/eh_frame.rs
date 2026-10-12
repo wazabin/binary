@@ -298,7 +298,7 @@ fn parse_fde(
         let range = c.encoded(cie.fde_enc & 0x0f)?;
         let mut lsda = None;
         let aug_len = c.uleb()?;
-        let aug_end = c.p + aug_len as usize;
+        let aug_end = c.p.checked_add(usize::try_from(aug_len).ok()?)?;
         if cie.lsda_enc != OMIT {
             lsda = Some(c.encoded(cie.lsda_enc)?);
         }

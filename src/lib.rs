@@ -56,10 +56,10 @@ impl Format {
         if bytes.starts_with(b"MZ") {
             let e_lfanew = bytes.get(0x3c..0x40)?;
             let at = u32::from_le_bytes(e_lfanew.try_into().ok()?) as usize;
-            if bytes.get(at..at + 4) == Some(b"PE\0\0") {
+            if bytes.get(at..at.checked_add(4)?) == Some(b"PE\0\0") {
                 return Some(Format::Pe);
             }
-            if bytes.get(at..at + 2) == Some(b"LE") {
+            if bytes.get(at..at.checked_add(2)?) == Some(b"LE") {
                 return Some(Format::Le);
             }
         }

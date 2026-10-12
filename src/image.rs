@@ -373,6 +373,12 @@ fn le64(b: &[u8], at: usize) -> Option<u64> {
     ))
 }
 
+/// The `len` bytes at file offset `off`, if the file holds them all.
+fn file_range(file: &[u8], off: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(off).ok()?;
+    file.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+}
+
 /// The NUL-terminated string at `at`, or `""` when it is not UTF-8.
 fn cstr(b: &[u8], at: usize) -> &str {
     let Some(tail) = b.get(at..) else { return "" };
@@ -503,31 +509,35 @@ impl<'a> Image<'a> {
         // --- program headers -------------------------------------------------
         let mut phdrs = Vec::with_capacity(phnum);
         for i in 0..phnum {
-            let at = (phoff as usize)
-                .checked_add(i * phentsize)
+            // The entry's bytes from its start: field offsets are small, the
+            // table's offset is the file's word.
+            let e = usize::try_from(phoff)
+                .ok()
+                .and_then(|o| o.checked_add(i * phentsize))
+                .and_then(|at| file.get(at..))
                 .ok_or(ElfError::Truncated("program headers"))?;
             let ph = if fmt.is_64 {
                 (|| {
                     Some(Phdr {
-                        kind: le32(file, at)?,
-                        flags: le32(file, at + 4)?,
-                        offset: le64(file, at + 8)?,
-                        vaddr: le64(file, at + 16)?,
-                        filesz: le64(file, at + 32)?,
-                        memsz: le64(file, at + 40)?,
-                        align: le64(file, at + 48)?,
+                        kind: le32(e, 0)?,
+                        flags: le32(e, 4)?,
+                        offset: le64(e, 8)?,
+                        vaddr: le64(e, 16)?,
+                        filesz: le64(e, 32)?,
+                        memsz: le64(e, 40)?,
+                        align: le64(e, 48)?,
                     })
                 })()
             } else {
                 (|| {
                     Some(Phdr {
-                        kind: le32(file, at)?,
-                        offset: u64::from(le32(file, at + 4)?),
-                        vaddr: u64::from(le32(file, at + 8)?),
-                        filesz: u64::from(le32(file, at + 16)?),
-                        memsz: u64::from(le32(file, at + 20)?),
-                        flags: le32(file, at + 24)?,
-                        align: u64::from(le32(file, at + 28)?),
+                        kind: le32(e, 0)?,
+                        offset: u64::from(le32(e, 4)?),
+                        vaddr: u64::from(le32(e, 8)?),
+                        filesz: u64::from(le32(e, 16)?),
+                        memsz: u64::from(le32(e, 20)?),
+                        flags: le32(e, 24)?,
+                        align: u64::from(le32(e, 28)?),
                     })
                 })()
             };
@@ -541,10 +551,10 @@ impl<'a> Image<'a> {
         for ph in &phdrs {
             match ph.kind {
                 PT_LOAD => {
-                    let start = ph.offset as usize;
-                    let end = start.checked_add(ph.filesz as usize);
-                    let bytes = end
-                        .and_then(|e| file.get(start..e))
+                    // The file bytes must be in the file, and the memory
+                    // image below the top of the address space.
+                    let bytes = file_range(file, ph.offset, ph.filesz)
+                        .filter(|_| ph.vaddr.checked_add(ph.memsz.max(ph.filesz)).is_some())
                         .ok_or(ElfError::SegmentOutOfBounds(ph.vaddr))?;
                     segments.push(Segment {
                         vaddr: ph.vaddr,
@@ -559,8 +569,7 @@ impl<'a> Image<'a> {
                 PT_GNU_RELRO => relro = Some((ph.vaddr, ph.memsz)),
                 PT_GNU_EH_FRAME if ph.memsz > 0 => eh_hdr = Some((ph.vaddr, ph.memsz)),
                 PT_TLS if ph.memsz > 0 => {
-                    let (s, n) = (ph.offset as usize, ph.filesz as usize);
-                    if let Some(init) = s.checked_add(n).and_then(|e| file.get(s..e)) {
+                    if let Some(init) = file_range(file, ph.offset, ph.filesz) {
                         tls = Some(Tls {
                             vaddr: ph.vaddr,
                             memsz: ph.memsz,
@@ -580,29 +589,33 @@ impl<'a> Image<'a> {
         let mut shdrs: Vec<Shdr> = Vec::new();
         if opts.sections && shoff != 0 && shnum != 0 {
             for i in 0..shnum {
-                let at = (shoff as usize).saturating_add(i * shentsize);
+                let e = usize::try_from(shoff)
+                    .ok()
+                    .and_then(|o| o.checked_add(i * shentsize))
+                    .and_then(|at| file.get(at..))
+                    .unwrap_or(&[]);
                 let sh = if fmt.is_64 {
                     (|| {
                         Some(Shdr {
-                            name: le32(file, at)?,
-                            kind: le32(file, at + 4)?,
-                            flags: le64(file, at + 8)?,
-                            addr: le64(file, at + 16)?,
-                            offset: le64(file, at + 24)?,
-                            size: le64(file, at + 32)?,
-                            link: le32(file, at + 40)?,
+                            name: le32(e, 0)?,
+                            kind: le32(e, 4)?,
+                            flags: le64(e, 8)?,
+                            addr: le64(e, 16)?,
+                            offset: le64(e, 24)?,
+                            size: le64(e, 32)?,
+                            link: le32(e, 40)?,
                         })
                     })()
                 } else {
                     (|| {
                         Some(Shdr {
-                            name: le32(file, at)?,
-                            kind: le32(file, at + 4)?,
-                            flags: u64::from(le32(file, at + 8)?),
-                            addr: u64::from(le32(file, at + 12)?),
-                            offset: u64::from(le32(file, at + 16)?),
-                            size: u64::from(le32(file, at + 20)?),
-                            link: le32(file, at + 24)?,
+                            name: le32(e, 0)?,
+                            kind: le32(e, 4)?,
+                            flags: u64::from(le32(e, 8)?),
+                            addr: u64::from(le32(e, 12)?),
+                            offset: u64::from(le32(e, 16)?),
+                            size: u64::from(le32(e, 20)?),
+                            link: le32(e, 24)?,
                         })
                     })()
                 };
@@ -615,13 +628,8 @@ impl<'a> Image<'a> {
                 }
             }
         }
-        let sec_bytes = |s: &Shdr| -> &'a [u8] {
-            let start = s.offset as usize;
-            start
-                .checked_add(s.size as usize)
-                .and_then(|e| file.get(start..e))
-                .unwrap_or(&[])
-        };
+        let sec_bytes =
+            |s: &Shdr| -> &'a [u8] { file_range(file, s.offset, s.size).unwrap_or(&[]) };
         let shstr: &'a [u8] = shdrs
             .get(shstrndx)
             .filter(|_| shstrndx != 0)
@@ -701,7 +709,7 @@ impl<'a> Image<'a> {
             let n = img.dynsym_entries(&tags);
             let b = img.bytes_from(symtab).unwrap_or(&[]);
             img.read_symbols(
-                &b[..b.len().min(n * fmt.sym_size())],
+                &b[..b.len().min(n.saturating_mul(fmt.sym_size()))],
                 strs,
                 Table::Dynsym,
                 &mut symbols,
@@ -818,9 +826,9 @@ impl<'a> Image<'a> {
         for s in shdrs.iter().filter(|s| {
             matches!(s.kind, SHT_RELA | SHT_REL) && s.flags & SHF_ALLOC != 0 && s.addr != 0
         }) {
-            let covered = ranges
-                .iter()
-                .any(|&(a, n, _)| s.addr >= a && s.addr + s.size <= a + n);
+            let covered = ranges.iter().any(|&(a, n, _)| {
+                s.addr >= a && s.addr.saturating_add(s.size) <= a.saturating_add(n)
+            });
             if !covered {
                 img.read_relocs(sec_bytes(s), s.kind == SHT_RELA, &mut relocs);
             }
@@ -918,7 +926,11 @@ impl<'a> Image<'a> {
     fn reloc_symbols(&self, tags: &[(i64, u64)]) -> usize {
         let tag = |t: i64| tags.iter().find(|(k, _)| *k == t).map(|(_, v)| *v);
         let mut relocs = Vec::new();
-        for (a, n, rela) in [(DT_RELA, DT_RELASZ, true), (DT_JMPREL, DT_PLTRELSZ, self.fmt.is_64), (DT_REL, DT_RELSZ, false)] {
+        for (a, n, rela) in [
+            (DT_RELA, DT_RELASZ, true),
+            (DT_JMPREL, DT_PLTRELSZ, self.fmt.is_64),
+            (DT_REL, DT_RELSZ, false),
+        ] {
             if let (Some(a), Some(n)) = (tag(a), tag(n))
                 && let Some(b) = self.read(a, n as usize)
             {
@@ -1303,8 +1315,9 @@ impl<'a> Image<'a> {
                 .iter()
                 .find(|ph| ph.kind == PT_LOAD && ph.offset == 0)
         {
-            let end = phoff + u64::from(phnum) * u64::from(phentsize);
-            if end <= first.filesz {
+            let end = phoff.checked_add(u64::from(phnum) * u64::from(phentsize));
+            if let Some(end) = end.filter(|&e| e <= first.filesz) {
+                // A `PT_LOAD` ends below the top of the address space.
                 out.push((first.vaddr, first.vaddr + end));
             }
         }
@@ -1319,7 +1332,7 @@ impl<'a> Image<'a> {
             .phdrs
             .iter()
             .filter(|ph| ph.kind == PT_NOTE && ph.memsz > 0)
-            .map(|ph| (ph.vaddr, ph.vaddr + ph.memsz))
+            .filter_map(|ph| Some((ph.vaddr, ph.vaddr.checked_add(ph.memsz)?)))
             .collect();
         notes.sort();
         let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -1344,7 +1357,7 @@ impl<'a> Image<'a> {
             self.phdrs
                 .iter()
                 .filter(|ph| ph.kind == PT_PHDR)
-                .map(|ph| (ph.vaddr, ph.vaddr + ph.memsz)),
+                .filter_map(|ph| Some((ph.vaddr, ph.vaddr.checked_add(ph.memsz)?))),
         );
         all.retain(|(a, e)| e > a);
         all.sort();
@@ -1352,7 +1365,7 @@ impl<'a> Image<'a> {
         let mut out: Vec<(u64, u64)> = Vec::new();
         for (a, e) in all {
             match out.last_mut() {
-                Some(last) if a <= last.1 + 64 => last.1 = last.1.max(e),
+                Some(last) if a <= last.1.saturating_add(64) => last.1 = last.1.max(e),
                 _ => out.push((a, e)),
             }
         }
@@ -1368,7 +1381,7 @@ impl<'a> Image<'a> {
         let fmt = self.fmt;
         let mut ends: Vec<(u64, u64)> = Vec::new();
         for ph in self.phdrs.iter().filter(|ph| ph.kind == PT_INTERP) {
-            ends.push((ph.vaddr, ph.vaddr + ph.memsz));
+            ends.extend(ph.vaddr.checked_add(ph.memsz).map(|e| (ph.vaddr, e)));
         }
         let tags = self
             .phdrs
@@ -1386,7 +1399,7 @@ impl<'a> Image<'a> {
                 (DT_RELR, DT_RELRSZ),
             ] {
                 if let (Some(a), Some(n)) = (tag(at), tag(size)) {
-                    ends.push((a, a + n));
+                    ends.extend(a.checked_add(n).map(|e| (a, e)));
                 }
             }
             // The symbol table runs up to the string table in both layouts;
@@ -1399,7 +1412,12 @@ impl<'a> Image<'a> {
             if let (Some(s), Some(t)) = (symtab, strtab) {
                 ends.push((s, s.max(t)));
                 if let Some(v) = tag(DT_VERSYM) {
-                    ends.push((v, v + 2 * (t.saturating_sub(s) / syment)));
+                    let n = t.saturating_sub(s) / syment;
+                    ends.extend(
+                        n.checked_mul(2)
+                            .and_then(|n| v.checked_add(n))
+                            .map(|e| (v, e)),
+                    );
                 }
             }
             // `.gnu.version_r`: a chain of Verneed records, each with its
@@ -1414,8 +1432,9 @@ impl<'a> Image<'a> {
                         u64::from(le32(b, 8).unwrap_or(0)),
                         u64::from(le32(b, 12).unwrap_or(0)),
                     );
+                    // Each record was read, so it ends inside its segment.
                     end = end.max(at + 16);
-                    let mut a = at + aux;
+                    let mut a = at.wrapping_add(aux);
                     for _ in 0..cnt.min(1024) {
                         let Some(x) = self.read(a, 16) else { break };
                         end = end.max(a + 16);
@@ -1423,12 +1442,12 @@ impl<'a> Image<'a> {
                         if nx == 0 {
                             break;
                         }
-                        a += nx;
+                        a = a.wrapping_add(nx);
                     }
                     if next == 0 {
                         break;
                     }
-                    at += next;
+                    at = at.wrapping_add(next);
                 }
                 ends.push((start, end));
             }
@@ -1446,17 +1465,18 @@ impl<'a> Image<'a> {
                     u64::from(le32(h, 0).unwrap_or(0)),
                     u64::from(le32(h, 4).unwrap_or(0)),
                 );
-                ends.push((a, a + 4 * (2 + nb + nc)));
+                ends.extend(a.checked_add(4 * (2 + nb + nc)).map(|e| (a, e)));
             }
             if let Some(a) = tag(DT_GNU_HASH)
                 && let Some(h) = self.read(a, 16)
             {
                 let w = |i: usize| u64::from(le32(h, 4 * i).unwrap_or(0));
                 let (nb, symoff, bloom) = (w(0), w(1), w(2));
-                ends.push((
-                    a,
-                    a + 16 + 8 * bloom + 4 * nb + 4 * nsyms.saturating_sub(symoff),
-                ));
+                let size = nsyms
+                    .saturating_sub(symoff)
+                    .checked_mul(4)
+                    .and_then(|chains| chains.checked_add(16 + 8 * bloom + 4 * nb));
+                ends.extend(size.and_then(|n| a.checked_add(n)).map(|e| (a, e)));
             }
         }
         ends.retain(|(a, e)| e > a);
@@ -1487,10 +1507,14 @@ impl<'a> Image<'a> {
     /// code pointers in data skips them (their pc-relative entries, read as
     /// words, look like addresses by chance).
     pub fn unwind_tables(&self) -> Vec<(u64, u64)> {
-        let mut out: Vec<(u64, u64)> = self.eh_hdr.map(|(a, n)| (a, a + n)).into_iter().collect();
+        let mut out: Vec<(u64, u64)> = self
+            .eh_hdr
+            .and_then(|(a, n)| Some((a, a.checked_add(n)?)))
+            .into_iter()
+            .collect();
         for name in [".eh_frame", ".gcc_except_table"] {
             if let Some(s) = self.section(name).filter(|s| s.size > 0) {
-                out.push((s.addr, s.addr + s.size));
+                out.extend(s.addr.checked_add(s.size).map(|e| (s.addr, e)));
             }
         }
         out.sort();
@@ -1518,7 +1542,7 @@ impl<'a> Image<'a> {
             .sections
             .iter()
             .filter(|s| matches!(s.name, ".plt" | ".plt.sec" | ".plt.got"))
-            .map(|s| (s.addr, s.addr + s.size))
+            .map(|s| (s.addr, s.addr.saturating_add(s.size)))
             .collect();
         let mut out = Vec::new();
         for addr in self.eh_function_starts() {
