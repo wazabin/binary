@@ -308,6 +308,8 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
         return;
     };
     let strings = pe.header.coff_header.strings(file_bytes).ok().flatten();
+    // Only i386 decorates C names with a leading underscore.
+    let decorated = pe.header.coff_header.machine == COFF_MACHINE_X86;
 
     for (_index, inline_name, symbol) in symbols.iter() {
         if !symbol.is_function_definition() {
@@ -319,6 +321,11 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
         };
         let Some(name) = symbol_name(&symbol, inline_name, strings.as_ref()) else {
             continue;
+        };
+        let name = if decorated {
+            undecorate(name)
+        } else {
+            name.to_owned()
         };
         let Some(address) = pe
             .image_base
@@ -336,15 +343,15 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
     }
 }
 
-fn symbol_name(
-    symbol: &CoffSymbol,
-    inline_name: Option<&str>,
-    strings: Option<&goblin::strtab::Strtab<'_>>,
-) -> Option<String> {
+fn symbol_name<'a>(
+    symbol: &'a CoffSymbol,
+    inline_name: Option<&'a str>,
+    strings: Option<&goblin::strtab::Strtab<'a>>,
+) -> Option<&'a str> {
     if let Some(name) = inline_name
         && !name.is_empty()
     {
-        return Some(normalize_coff_name(name));
+        return Some(name);
     }
 
     // A long name (first byte 0) is a string-table offset in the last four
@@ -353,7 +360,7 @@ fn symbol_name(
     if symbol.name[0] == 0 {
         let offset = u32::from_le_bytes(symbol.name[4..].try_into().ok()?);
         let name = strings?.get_at(offset.checked_sub(4)? as usize)?;
-        return (!name.is_empty()).then(|| normalize_coff_name(name));
+        return (!name.is_empty()).then_some(name);
     }
 
     let end = symbol
@@ -362,10 +369,11 @@ fn symbol_name(
         .position(|&b| b == 0)
         .unwrap_or(symbol.name.len());
     let name = std::str::from_utf8(&symbol.name[..end]).ok()?;
-    (!name.is_empty()).then(|| normalize_coff_name(name))
+    (!name.is_empty()).then_some(name)
 }
 
-fn normalize_coff_name(name: &str) -> String {
+/// An i386 C name without the underscore the compiler prefixes it with.
+fn undecorate(name: &str) -> String {
     name.strip_prefix('_').unwrap_or(name).to_string()
 }
 
@@ -855,6 +863,21 @@ mod tests {
         let file_backed = pe.sections[0].data.len();
         assert!(regions[0].1.len() - file_backed <= crate::ZERO_FILL_LIMIT as usize);
         assert_eq!(regions[0].1[..2], [0xff, 0x25]);
+    }
+
+    #[test]
+    fn only_i386_names_lose_a_leading_underscore() {
+        // i386 cdecl decorates `main` as `_main`.
+        let pe = PeBinary::parse(&pe_image(false, &["_main", "_helper"])).unwrap();
+        assert_eq!(pe.symbol_address("main"), Some(0x40_1000));
+        assert_eq!(pe.symbol_address("helper"), Some(0x40_1004));
+        // x86-64 does not decorate: `_guard` is the name itself, as is
+        // `__chkstk`'s second underscore.
+        let pe = PeBinary::parse(&pe_image(true, &["main", "_guard", "__chk"])).unwrap();
+        assert_eq!(pe.symbol_address("main"), Some(0x40_1000));
+        assert_eq!(pe.symbol_address("_guard"), Some(0x40_1004));
+        assert_eq!(pe.symbol_address("__chk"), Some(0x40_1008));
+        assert_eq!(pe.symbol_address("guard"), None);
     }
 
     #[test]
