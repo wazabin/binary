@@ -520,11 +520,11 @@ impl BinaryFormat for PeBinary {
     }
 
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
+        let mut budget = crate::ZERO_FILL_LIMIT;
         self.sections
             .iter()
             .map(|sec| {
-                let mut bytes = sec.data.clone();
-                bytes.resize(sec.mem_size as usize, 0);
+                let bytes = crate::zero_filled(&sec.data, sec.mem_size, &mut budget);
                 // Both flags are the section table's own, so a snapshot built
                 // from these regions answers `is_executable` and
                 // `is_known_read_only` exactly as the live binary does.
@@ -842,6 +842,19 @@ mod tests {
         let image_base = 0x40 + 4 + 20 + 24;
         b[image_base..image_base + 8].copy_from_slice(&(u64::MAX - 0xfff).to_le_bytes());
         exercise(&b);
+    }
+
+    #[test]
+    fn mapped_regions_materialize_at_most_the_zero_fill_budget() {
+        let mut b = pe_image(true, &[]);
+        let virtual_size = 0x40 + 4 + 20 + 240 + 8;
+        b[virtual_size..virtual_size + 4].copy_from_slice(&0xffff_0000u32.to_le_bytes());
+        let pe = PeBinary::parse(&b).unwrap();
+        let regions = pe.mapped_regions();
+        assert_eq!(regions.len(), 1);
+        let file_backed = pe.sections[0].data.len();
+        assert!(regions[0].1.len() - file_backed <= crate::ZERO_FILL_LIMIT as usize);
+        assert_eq!(regions[0].1[..2], [0xff, 0x25]);
     }
 
     #[test]

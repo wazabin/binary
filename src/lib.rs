@@ -14,6 +14,8 @@
 mod arch;
 mod symbols;
 mod target_os;
+#[cfg(test)]
+mod test_alloc;
 
 pub mod blob;
 pub mod eh;
@@ -25,6 +27,32 @@ pub mod pe;
 
 pub use arch::Arch;
 pub use target_os::TargetOs;
+
+/// The most bytes of zero-filled memory the containers here materialize for
+/// one image: 256 MiB.
+///
+/// Zero fill is memory a container sizes but does not store (an ELF
+/// segment's `p_memsz` past its `p_filesz`, a PE section's virtual size past
+/// its raw data, an LE object's zero pages). Its size is a header value, so
+/// without a cap a file of a few hundred bytes could ask for terabytes.
+/// [`BinaryFormat::mapped_regions`] materializes zero fill up to this budget,
+/// in region order, and past it returns a region's file-backed bytes only;
+/// [`le::LeBinary::parse`] stops filling an object's trailing zero pages at the
+/// budget, and fails with [`le::LeError::TooLarge`] when a file page, or a
+/// fixup, lies past more zero fill than the budget holds.
+pub const ZERO_FILL_LIMIT: u64 = 256 << 20;
+
+/// A region for [`BinaryFormat::mapped_regions`]: the first `size` bytes of
+/// `data`, then zeros up to `size` while `budget` lasts.
+pub(crate) fn zero_filled(data: &[u8], size: u64, budget: &mut u64) -> Vec<u8> {
+    let data = &data[..data.len().min(usize::try_from(size).unwrap_or(usize::MAX))];
+    let tail = size.saturating_sub(data.len() as u64).min(*budget);
+    *budget -= tail;
+    // Zeroed by the allocator, then the file bytes over the front.
+    let mut bytes = vec![0u8; data.len() + tail as usize];
+    bytes[..data.len()].copy_from_slice(data);
+    bytes
+}
 
 /// The byte order a container was parsed with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +394,9 @@ pub trait BinaryFormat: Send + Sync {
     /// At snapshot-save time the persistence layer copies these into a
     /// serializable `MemoryImage` so a reloaded session is self-describing.
     /// Each region's `bytes` should cover its full in-memory size (zero-filled
-    /// tail included), mirroring [`byte_at`].
+    /// tail included), mirroring [`byte_at`]. The containers of this crate
+    /// materialize at most [`ZERO_FILL_LIMIT`] bytes of zero fill in all; a
+    /// region past that budget carries its file-backed bytes only.
     ///
     /// Defaults to empty for formats that do not expose their segments.
     ///

@@ -838,13 +838,13 @@ impl BinaryFormat for ElfBinary {
     }
 
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
+        let mut budget = crate::ZERO_FILL_LIMIT;
         self.segments
             .iter()
             .map(|seg| {
                 // Materialize the `p_memsz > p_filesz` zero-fill tail so reads
                 // line up with `byte_at` (which returns 0 there).
-                let mut bytes = seg.data.clone();
-                bytes.resize(seg.mem_size as usize, 0);
+                let bytes = crate::zero_filled(&seg.data, seg.mem_size, &mut budget);
                 (seg.start, bytes, seg.executable, seg.writable)
             })
             .collect()

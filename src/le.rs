@@ -189,6 +189,9 @@ pub enum LeError {
     BadFixup { offset: usize },
     /// A header or fixup names an object the object table does not have.
     BadObject(u32),
+    /// Object `n` has a file page, or a fixup, past more zero-filled memory
+    /// than [`ZERO_FILL_LIMIT`](crate::ZERO_FILL_LIMIT) allows to materialize.
+    TooLarge(u32),
 }
 
 impl std::fmt::Display for LeError {
@@ -205,6 +208,11 @@ impl std::fmt::Display for LeError {
                 write!(f, "malformed LE fixup record at file offset 0x{offset:x}")
             }
             LeError::BadObject(n) => write!(f, "LE refers to missing object {n}"),
+            LeError::TooLarge(n) => write!(
+                f,
+                "LE object {n} needs more than {} MiB of zero fill",
+                crate::ZERO_FILL_LIMIT >> 20
+            ),
         }
     }
 }
@@ -257,6 +265,17 @@ impl Reader<'_> {
         let b = self.get(at.saturating_add(1), len, what)?;
         Ok(String::from_utf8_lossy(b).into_owned())
     }
+}
+
+/// Grow `data` with zeros to `len` bytes, charging the growth to `budget`;
+/// `None`, and `data` unchanged, when the budget is short.
+fn zero_extend(data: &mut Vec<u8>, len: u64, budget: &mut u64) -> Option<()> {
+    let grow = len.saturating_sub(data.len() as u64);
+    if grow > 0 {
+        *budget = budget.checked_sub(grow)?;
+        data.resize(len as usize, 0);
+    }
+    Some(())
 }
 
 /// `base + offset` for a file offset (see [`Reader`]).
@@ -312,6 +331,8 @@ impl LeBinary {
         // indexes the fixup page table.
         let mut objects = Vec::new();
         let mut pages: Vec<(u32, u64)> = Vec::new(); // (logical page, linear address)
+        // Zero fill materialized so far, for the whole image.
+        let mut budget = crate::ZERO_FILL_LIMIT;
         for i in 0..object_count {
             let e = object_table.saturating_add((i as usize).saturating_mul(24));
             let virtual_size = r.u32(e, "object table")? as u64;
@@ -333,9 +354,13 @@ impl LeBinary {
                 let number = u32::from_be_bytes([0, entry[0], entry[1], entry[2]]);
                 let kind = entry[3];
                 // Offsets within the object, in u64: `j * page_size` is up
-                // to 64 bits wide.
+                // to 64 bits wide. Only bytes below the virtual size are the
+                // object's.
                 let offset = u64::from(j) * u64::from(page_size);
-                data.resize(offset as usize, 0);
+                let in_object = offset < virtual_size;
+                if in_object {
+                    data.truncate(offset as usize);
+                }
                 match kind {
                     0 => {
                         let size = if number == module_pages {
@@ -348,10 +373,24 @@ impl LeBinary {
                         let start = u64::from(physical) * u64::from(page_size);
                         let start = usize::try_from(start)
                             .map_or(usize::MAX, |s| data_pages.saturating_add(s));
-                        data.extend_from_slice(r.get(start, size as usize, "page")?);
+                        let page = r.get(start, size as usize, "page")?;
+                        if in_object {
+                            // The zero pages before this one are filled in.
+                            zero_extend(&mut data, offset, &mut budget)
+                                .ok_or(LeError::TooLarge(i + 1))?;
+                            let n = page.len().min((virtual_size - offset) as usize);
+                            data.extend_from_slice(&page[..n]);
+                        }
                     }
-                    // Zero-filled (3) and invalid (2) pages read as zeros.
-                    2 | 3 => data.resize((offset + u64::from(page_size)) as usize, 0),
+                    // Zero-filled (3) and invalid (2) pages read as zeros,
+                    // filled in while the budget lasts (past it, `data` ends
+                    // before them and they read as zeros all the same).
+                    2 | 3 => {
+                        if in_object {
+                            let end = (offset + u64::from(page_size)).min(virtual_size);
+                            let _ = zero_extend(&mut data, end, &mut budget);
+                        }
+                    }
                     flags => {
                         return Err(LeError::UnsupportedPage {
                             page: logical,
@@ -401,7 +440,7 @@ impl LeBinary {
         binary.entrypoint = binary.linear(h32(0x18)?, h32(0x1c)?)?;
         binary.initial_stack = binary.linear(h32(0x20)?, h32(0x24)?)?;
         for f in &fixups {
-            binary.apply(f)?;
+            binary.apply(f, &mut budget)?;
         }
         binary.fixups = fixups;
         Ok(binary)
@@ -437,8 +476,9 @@ impl LeBinary {
     }
 
     /// Write the offset part of an internal fixup into its object's bytes.
-    /// Selector parts are left as the file has them.
-    fn apply(&mut self, fixup: &LeFixup) -> Result<(), LeError> {
+    /// Selector parts are left as the file has them. Zero fill the write
+    /// needs is charged to `budget`.
+    fn apply(&mut self, fixup: &LeFixup, budget: &mut u64) -> Result<(), LeError> {
         let LeFixupTarget::Internal { object, .. } = fixup.target else {
             return Ok(());
         };
@@ -461,9 +501,7 @@ impl LeBinary {
         if let Some(obj) = self.objects.iter_mut().find(|o| o.contains(at)) {
             let off = (at - obj.base) as usize;
             let end = (off + value.len()).min(obj.virtual_size as usize);
-            if obj.data.len() < end {
-                obj.data.resize(end, 0);
-            }
+            zero_extend(&mut obj.data, end as u64, budget).ok_or(LeError::TooLarge(obj.number))?;
             for (i, b) in value.into_iter().enumerate() {
                 if let Some(slot) = obj.data.get_mut(off + i) {
                     *slot = b;
@@ -665,11 +703,11 @@ impl BinaryFormat for LeBinary {
     }
 
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
+        let mut budget = crate::ZERO_FILL_LIMIT;
         self.objects
             .iter()
             .map(|o| {
-                let mut bytes = o.data.clone();
-                bytes.resize(o.virtual_size as usize, 0);
+                let bytes = crate::zero_filled(&o.data, o.virtual_size, &mut budget);
                 (o.base, bytes, o.executable(), o.writable())
             })
             .collect()
@@ -937,6 +975,49 @@ mod tests {
                 exercise(&f);
             }
         }
+    }
+
+    fn put32(f: &mut [u8], at: usize, v: u32) {
+        f[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// `sample` with 512 MiB pages: one physical page (the last, so it is
+    /// `last_page_size` long), page-map entries `entries` and a 1 GiB object 1
+    /// of two pages.
+    fn with_huge_pages(entries: [[u8; 4]; 2]) -> Vec<u8> {
+        let mut f = with_object_field(0, 0, 0x4000_0000);
+        put32(&mut f, 0x40 + 0x14, 1); // module pages
+        put32(&mut f, 0x40 + 0x28, 0x2000_0000); // page size
+        put32(&mut f, 0x40 + 0xc4 + 16, 2); // object 1: two pages
+        f[0x40 + 0xf4..0x40 + 0xf8].copy_from_slice(&entries[0]);
+        f[0x40 + 0xf8..0x40 + 0xfc].copy_from_slice(&entries[1]);
+        f
+    }
+
+    #[test]
+    fn a_file_page_past_more_zero_fill_than_the_budget_is_an_error() {
+        // Object 1: a zero page, then a file page 512 MiB in.
+        let f = with_huge_pages([[0, 0, 0, 3], [0, 0, 1, 0]]);
+        assert_eq!(LeBinary::parse(&f).unwrap_err(), LeError::TooLarge(1));
+    }
+
+    #[test]
+    fn a_fixup_past_more_zero_fill_than_the_budget_is_an_error() {
+        // Object 1: a file page, then a zero page 512 MiB in whose fixups
+        // (logical page 2's) write there.
+        let f = with_huge_pages([[0, 0, 1, 0], [0, 0, 0, 3]]);
+        assert_eq!(LeBinary::parse(&f).unwrap_err(), LeError::TooLarge(1));
+    }
+
+    #[test]
+    fn mapped_regions_materialize_at_most_the_zero_fill_budget() {
+        let b = LeBinary::parse(&with_object_field(1, 0, u32::MAX)).unwrap();
+        let regions = b.mapped_regions();
+        assert_eq!(regions[0].1.len(), 0x40, "object 1 whole");
+        let file_backed: usize = b.objects.iter().map(|o| o.data.len()).sum();
+        let total: usize = regions.iter().map(|r| r.1.len()).sum();
+        assert!(total - file_backed <= crate::ZERO_FILL_LIMIT as usize);
+        assert_eq!(&regions[1].1[..0x20], &b.objects[1].data[..0x20]);
     }
 
     #[test]
