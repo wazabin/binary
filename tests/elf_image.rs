@@ -330,3 +330,21 @@ fn headers_are_the_elf_header_table_and_notes() {
         [(0, 400), (0x3c0, 0x3f0)]
     );
 }
+
+#[test]
+fn gnu_hash_symbol_count_reads_one_chain() {
+    // 100 000 buckets that all start one unterminated 100 000-entry chain:
+    // walking every bucket's chain is 10^10 steps, the last chain alone 10^5.
+    let n = 100_000;
+    let bytes = with_gnu_hash(1, &vec![1; n], &vec![0; n]);
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let img = Image::load_segments(&bytes).unwrap();
+        done.send(img.dynsyms().len()).unwrap();
+    });
+    let count = wait
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the symbol count is linear in the hash table");
+    // As many as `.dynsym` holds before its bytes run out.
+    assert!(count > 8, "{count}");
+}

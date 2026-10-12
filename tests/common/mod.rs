@@ -394,3 +394,37 @@ fn add_sections(b: &mut Buf) {
     b.u16(60, (secs.len() + 2) as u16);
     b.u16(62, (secs.len() + 1) as u16);
 }
+
+/// `DT_GNU_HASH`.
+pub const DT_GNU_HASH: u64 = 0x6fff_fef5;
+/// Where [`with_gnu_hash`] puts its table.
+pub const GNU_HASH: u64 = 0x4000;
+
+/// The image without a section table, its `DT_HASH` replaced by a
+/// `DT_GNU_HASH` at [`GNU_HASH`]: `symoffset`, one bloom word, `buckets` and
+/// `chains`, appended to the second segment (which then reaches it).
+pub fn with_gnu_hash(symoffset: u32, buckets: &[u32], chains: &[u32]) -> Vec<u8> {
+    let mut b = Buf(build(false));
+    let at = 0x2000;
+    b.u32(at, buckets.len() as u32);
+    b.u32(at + 4, symoffset);
+    b.u32(at + 8, 1); // bloom size
+    b.u32(at + 12, 6); // bloom shift
+    b.u64(at + 16, u64::MAX);
+    for (i, v) in buckets.iter().chain(chains).enumerate() {
+        b.u32(at + 24 + 4 * i, *v);
+    }
+    let end = (at + 24 + 4 * (buckets.len() + chains.len())) as u64;
+    // The dynamic entry that was `DT_HASH`.
+    for i in 0..21 {
+        let e = 0x1000 + 16 * i;
+        if b.0[e..e + 8] == 4u64.to_le_bytes() {
+            b.u64(e, DT_GNU_HASH);
+            b.u64(e + 8, GNU_HASH);
+        }
+    }
+    // The RW segment's p_filesz and p_memsz.
+    b.u64(64 + 56 + 32, end - 0x1000);
+    b.u64(64 + 56 + 40, end - 0x1000);
+    b.0
+}

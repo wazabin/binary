@@ -880,16 +880,21 @@ impl<'a> Image<'a> {
             let bloom_word = if self.fmt.is_64 { 8 } else { 4 };
             let buckets = 16 + bloom as usize * bloom_word;
             let chains = buckets + nb as usize * 4;
-            let mut max = 0u32;
+            // The chains are laid out in bucket order, so the bucket with the
+            // highest start holds the last chain: the highest index is where
+            // that chain ends (its terminator, or the end of the table).
+            // Walking every bucket's chain instead is quadratic when buckets
+            // share one long chain.
+            let mut last = 0u32;
             for i in 0..nb as usize {
-                let Some(mut idx) = le32(b, buckets + 4 * i) else {
+                let Some(idx) = le32(b, buckets + 4 * i) else {
                     break;
                 };
-                if idx == 0 {
-                    continue;
-                }
+                last = last.max(idx);
+            }
+            if last > 0 {
+                let mut idx = last;
                 loop {
-                    max = max.max(idx);
                     let Some(c) = idx
                         .checked_sub(symoff)
                         .and_then(|k| le32(b, chains + 4 * k as usize))
@@ -899,11 +904,12 @@ impl<'a> Image<'a> {
                     if c & 1 != 0 {
                         break;
                     }
-                    idx += 1;
+                    let Some(next) = idx.checked_add(1) else {
+                        break;
+                    };
+                    idx = next;
                 }
-            }
-            if max > 0 {
-                return max as usize + 1;
+                return idx as usize + 1;
             }
             return (symoff as usize).max(self.reloc_symbols(tags));
         }
