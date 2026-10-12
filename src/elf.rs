@@ -691,31 +691,49 @@ fn collect_import_symbols_inner(
     for shdr in shdrs.iter() {
         match shdr.sh_type {
             SHT_RELA => {
-                let relas = elf.section_data_as_relas(&shdr).ok()?;
+                let Ok(relas) = elf.section_data_as_relas(&shdr) else {
+                    continue;
+                };
                 for rela in relas {
                     if !is_got_import_relocation(rela.r_type) {
                         continue;
                     }
-                    let sym = dynsymtab.get(rela.r_sym as usize).ok()?;
-                    let name = dynstrtab.get(sym.st_name as usize).ok()?.to_owned();
+                    // A relocation whose symbol or name is unreadable
+                    // names nothing; the others still do.
+                    let Some(name) = dynsymtab
+                        .get(rela.r_sym as usize)
+                        .ok()
+                        .and_then(|sym| dynstrtab.get(sym.st_name as usize).ok())
+                    else {
+                        continue;
+                    };
                     out.push(ImportSymbol {
                         address: rela.r_offset,
-                        name,
+                        name: name.to_owned(),
                         library: import_library(rela.r_sym),
                     });
                 }
             }
             SHT_REL => {
-                let rels = elf.section_data_as_rels(&shdr).ok()?;
+                let Ok(rels) = elf.section_data_as_rels(&shdr) else {
+                    continue;
+                };
                 for rel in rels {
                     if !is_got_import_relocation(rel.r_type) {
                         continue;
                     }
-                    let sym = dynsymtab.get(rel.r_sym as usize).ok()?;
-                    let name = dynstrtab.get(sym.st_name as usize).ok()?.to_owned();
+                    // A relocation whose symbol or name is unreadable
+                    // names nothing; the others still do.
+                    let Some(name) = dynsymtab
+                        .get(rel.r_sym as usize)
+                        .ok()
+                        .and_then(|sym| dynstrtab.get(sym.st_name as usize).ok())
+                    else {
+                        continue;
+                    };
                     out.push(ImportSymbol {
                         address: rel.r_offset,
-                        name,
+                        name: name.to_owned(),
                         library: import_library(rel.r_sym),
                     });
                 }

@@ -450,3 +450,19 @@ fn the_plt_relocations_are_rela_or_rel_as_dt_pltrel_says() {
     let names: Vec<_> = img.imports.iter().map(|i| i.name).collect();
     assert_eq!(names, ["f", "g"]);
 }
+
+#[test]
+fn one_relocation_naming_a_missing_symbol_drops_only_itself() {
+    use wazabin_binary::BinaryFormat;
+    use wazabin_binary::elf::ElfBinary;
+
+    let mut b = Buf(build(true));
+    // The first GLOB_DAT of `.rela.dyn` (`__cxa_finalize`) names symbol 100
+    // of an 8-entry `.dynsym`.
+    b.u64(0x438 + 8, (100 << 32) | 6);
+    let elf = ElfBinary::parse(&b.0).unwrap();
+    assert_eq!(elf.import_symbol_name(FINALIZE_SLOT), None);
+    assert_eq!(elf.import_symbol_name(TYPEINFO_SLOT), Some("_ZTIi"));
+    assert_eq!(elf.import_symbol_name(PUTS_SLOT), Some("puts"));
+    assert_eq!(elf.import_symbol_name(FREE_SLOT), Some("free"));
+}
