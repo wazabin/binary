@@ -20,7 +20,7 @@ impl Blob {
         Self { load_address, data }
     }
 
-    /// Borrow `bytes` directly without copying.
+    /// A blob of a copy of `bytes` (a [`Blob`] owns its data).
     pub fn from_slice(load_address: u64, bytes: &[u8]) -> Self {
         Self {
             load_address,

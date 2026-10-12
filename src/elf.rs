@@ -3,7 +3,7 @@ use elf::{
     abi::{
         DT_NEEDED, EM_386, EM_X86_64, ET_CORE, ET_DYN, ET_EXEC, ET_REL, PF_W, PF_X, PT_LOAD,
         PT_PHDR, PT_TLS, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, SHF_ALLOC, SHF_EXECINSTR,
-        SHF_WRITE, SHT_DYNSYM, SHT_NOBITS, SHT_REL, SHT_RELA, SHT_SYMTAB, STT_FUNC,
+        SHF_WRITE, SHT_DYNSYM, SHT_NOBITS, SHT_REL, SHT_RELA, SHT_SYMTAB, STT_FUNC, STT_GNU_IFUNC,
     },
     endian::{AnyEndian, EndianParse},
 };
@@ -190,8 +190,8 @@ impl LoadSegment {
 /// [`ElfBinary::analysis`] is populated by two analysis passes run at parse
 /// time:
 /// - **Entrypoint**: `e_entry` from the ELF header.
-/// - **Known functions**: all `STT_FUNC` symbols found in `.symtab` or
-///   `.dynsym`, and PLT stubs.
+/// - **Known functions**: all `STT_FUNC` and `STT_GNU_IFUNC` symbols found in
+///   `.symtab` or `.dynsym`, and PLT stubs.
 /// - **Seeds**: every `.eh_frame` FDE start (nameless, but they survive
 ///   `strip`) and the constructor / destructor entry points, in
 ///   [`ElfAnalysis::seeds`], apart from the symbol-derived functions.
@@ -276,8 +276,8 @@ impl ElfBinary {
     /// Parse an ELF binary from raw file bytes.
     ///
     /// Records every `PT_LOAD` segment as a mapped region, reads the entrypoint
-    /// from the ELF header, and collects all `STT_FUNC` symbols from `.symtab`
-    /// and `.dynsym`.
+    /// from the ELF header, and collects all `STT_FUNC` and `STT_GNU_IFUNC`
+    /// symbols from `.symtab` and `.dynsym`.
     pub fn parse(file_bytes: &[u8]) -> Result<Self, ElfError> {
         let elf = ElfBytes::<AnyEndian>::minimal_parse(file_bytes)?;
 
@@ -480,8 +480,15 @@ fn collect_needed_libraries(elf: &ElfBytes<AnyEndian>) -> Vec<String> {
     out
 }
 
-/// Collect all `STT_FUNC` symbols from the section matching `section_type`
-/// (either `SHT_SYMTAB` or `SHT_DYNSYM`) into `out`.
+/// `STT_FUNC`, or `STT_GNU_IFUNC` (whose value is the resolver, a function
+/// too), as [`image::SymbolKind::Func`](crate::image::SymbolKind::Func) reads it.
+fn is_function(symtype: u8) -> bool {
+    matches!(symtype, STT_FUNC | STT_GNU_IFUNC)
+}
+
+/// Collect all function symbols (`STT_FUNC`, `STT_GNU_IFUNC`) from the
+/// section matching `section_type` (either `SHT_SYMTAB` or `SHT_DYNSYM`) into
+/// `out`.
 fn collect_func_symbols(
     elf: &ElfBytes<AnyEndian>,
     section_type: u32,
@@ -492,7 +499,7 @@ fn collect_func_symbols(
             return;
         };
         for sym in symtab.iter() {
-            if sym.st_symtype() == STT_FUNC && sym.st_value != 0 {
+            if is_function(sym.st_symtype()) && sym.st_value != 0 {
                 let name = strtab.get(sym.st_name as usize).ok().map(str::to_owned);
                 out.push(FunctionSymbol {
                     address: sym.st_value,
@@ -508,7 +515,7 @@ fn collect_func_symbols(
             return;
         };
         for sym in dynsymtab.iter() {
-            if sym.st_symtype() == STT_FUNC && sym.st_value != 0 {
+            if is_function(sym.st_symtype()) && sym.st_value != 0 {
                 let name = dynstrtab.get(sym.st_name as usize).ok().map(str::to_owned);
                 out.push(FunctionSymbol {
                     address: sym.st_value,
