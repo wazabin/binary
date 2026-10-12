@@ -900,13 +900,10 @@ impl<'a> Image<'a> {
             }
             if last > 0 {
                 let mut idx = last;
-                loop {
-                    let Some(c) = idx
-                        .checked_sub(symoff)
-                        .and_then(|k| le32(b, chains + 4 * k as usize))
-                    else {
-                        break;
-                    };
+                while let Some(c) = idx
+                    .checked_sub(symoff)
+                    .and_then(|k| le32(b, chains + 4 * k as usize))
+                {
                     if c & 1 != 0 {
                         break;
                     }
