@@ -634,7 +634,7 @@ impl<'a> Image<'a> {
         let shstr: &'a [u8] = shdrs
             .get(shstrndx)
             .filter(|_| shstrndx != 0)
-            .map(&sec_bytes)
+            .map(sec_bytes)
             .unwrap_or(&[]);
         let have_names = !shstr.is_empty();
         let sections: Vec<Section<'a>> = if have_names {
@@ -743,7 +743,7 @@ impl<'a> Image<'a> {
         let dynsym_sec = shdrs.iter().find(|s| s.kind == SHT_DYNSYM);
         let mut symbols = Vec::new();
         if let Some(sec) = dynsym_sec.filter(|_| have_names) {
-            let strs = shdrs.get(sec.link as usize).map(&sec_bytes).unwrap_or(&[]);
+            let strs = shdrs.get(sec.link as usize).map(sec_bytes).unwrap_or(&[]);
             img.read_symbols(sec_bytes(sec), strs, Table::Dynsym, &mut symbols);
         } else if let (Some(symtab), Some(strtab)) = (tag(DT_SYMTAB), tag(DT_STRTAB)) {
             let strsz = tag(DT_STRSZ).unwrap_or(0);
@@ -766,7 +766,7 @@ impl<'a> Image<'a> {
             .find(|s| s.kind == SHT_SYMTAB)
             .filter(|_| have_names)
         {
-            let strs = shdrs.get(sec.link as usize).map(&sec_bytes).unwrap_or(&[]);
+            let strs = shdrs.get(sec.link as usize).map(sec_bytes).unwrap_or(&[]);
             img.read_symbols(sec_bytes(sec), strs, Table::Symtab, &mut symbols);
         }
         img.symbols = symbols;
