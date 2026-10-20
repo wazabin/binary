@@ -5,19 +5,54 @@
 //! [`BinaryFormat`] trait. `qcode` re-exports [`TargetOs`] and (in Stage 2b)
 //! implements [`BinaryFormat`] for its serializable `MemoryImage`; `harbinger`
 //! re-exports this crate as `harbinger::format` and `harbinger::arch::Arch`.
+//!
+//! [`image::Image`] is the other way in: a borrowed, one-pass loader view of an
+//! ELF file (segments, relocations, symbols, imports, the dynamic table, TLS),
+//! with the exception tables ([`eh`], read through [`eh_frame`]) and the
+//! metadata function seeds on demand.
 
 mod arch;
 mod symbols;
 mod target_os;
+#[cfg(test)]
+mod test_alloc;
 
 pub mod blob;
+pub mod eh;
 pub mod eh_frame;
 pub mod elf;
+pub mod image;
 pub mod le;
 pub mod pe;
 
 pub use arch::Arch;
 pub use target_os::TargetOs;
+
+/// The most bytes of zero-filled memory the containers here materialize for
+/// one image: 256 MiB.
+///
+/// Zero fill is memory a container sizes but does not store (an ELF
+/// segment's `p_memsz` past its `p_filesz`, a PE section's virtual size past
+/// its raw data, an LE object's zero pages). Its size is a header value, so
+/// without a cap a file of a few hundred bytes could ask for terabytes.
+/// [`BinaryFormat::mapped_regions`] materializes zero fill up to this budget,
+/// in region order, and past it returns a region's file-backed bytes only;
+/// [`le::LeBinary::parse`] stops filling an object's trailing zero pages at the
+/// budget, and fails with [`le::LeError::TooLarge`] when a file page, or a
+/// fixup, lies past more zero fill than the budget holds.
+pub const ZERO_FILL_LIMIT: u64 = 256 << 20;
+
+/// A region for [`BinaryFormat::mapped_regions`]: the first `size` bytes of
+/// `data`, then zeros up to `size` while `budget` lasts.
+pub(crate) fn zero_filled(data: &[u8], size: u64, budget: &mut u64) -> Vec<u8> {
+    let data = &data[..data.len().min(usize::try_from(size).unwrap_or(usize::MAX))];
+    let tail = size.saturating_sub(data.len() as u64).min(*budget);
+    *budget -= tail;
+    // Zeroed by the allocator, then the file bytes over the front.
+    let mut bytes = vec![0u8; data.len() + tail as usize];
+    bytes[..data.len()].copy_from_slice(data);
+    bytes
+}
 
 /// The byte order a container was parsed with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +84,10 @@ impl Format {
         if bytes.starts_with(b"MZ") {
             let e_lfanew = bytes.get(0x3c..0x40)?;
             let at = u32::from_le_bytes(e_lfanew.try_into().ok()?) as usize;
-            if bytes.get(at..at + 4) == Some(b"PE\0\0") {
+            if bytes.get(at..at.checked_add(4)?) == Some(b"PE\0\0") {
                 return Some(Format::Pe);
             }
-            if bytes.get(at..at + 2) == Some(b"LE") {
+            if bytes.get(at..at.checked_add(2)?) == Some(b"LE") {
                 return Some(Format::Le);
             }
         }
@@ -76,6 +111,8 @@ pub enum LoadError {
     /// The bytes are not ELF, PE or LE; callers that accept raw images can
     /// fall back to [`blob::Blob`] with a load address of their choosing.
     UnknownFormat,
+    /// The bytes are a container [`image::Image`] does not read yet.
+    Unsupported(Format),
     Elf(elf::ElfError),
     Pe(pe::PeError),
     Le(le::LeError),
@@ -85,6 +122,7 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::UnknownFormat => write!(f, "not an ELF, PE or LE file"),
+            LoadError::Unsupported(fmt) => write!(f, "{fmt} is not supported here"),
             LoadError::Elf(e) => write!(f, "failed to parse ELF: {e}"),
             LoadError::Pe(e) => write!(f, "failed to parse PE: {e}"),
             LoadError::Le(e) => write!(f, "failed to parse LE: {e}"),
@@ -95,7 +133,7 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LoadError::UnknownFormat => None,
+            LoadError::UnknownFormat | LoadError::Unsupported(_) => None,
             LoadError::Elf(e) => Some(e),
             LoadError::Pe(e) => Some(e),
             LoadError::Le(e) => Some(e),
@@ -356,7 +394,9 @@ pub trait BinaryFormat: Send + Sync {
     /// At snapshot-save time the persistence layer copies these into a
     /// serializable `MemoryImage` so a reloaded session is self-describing.
     /// Each region's `bytes` should cover its full in-memory size (zero-filled
-    /// tail included), mirroring [`byte_at`].
+    /// tail included), mirroring [`byte_at`]. The containers of this crate
+    /// materialize at most [`ZERO_FILL_LIMIT`] bytes of zero fill in all; a
+    /// region past that budget carries its file-backed bytes only.
     ///
     /// Defaults to empty for formats that do not expose their segments.
     ///

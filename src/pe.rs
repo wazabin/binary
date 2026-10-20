@@ -79,7 +79,7 @@ const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 impl PeSection {
     fn end(&self) -> u64 {
-        self.start + self.mem_size
+        self.start.saturating_add(self.mem_size)
     }
 
     fn contains(&self, addr: u64) -> bool {
@@ -167,16 +167,27 @@ impl PeBinary {
             .sections
             .iter()
             .filter(|s| s.virtual_size > 0 || s.size_of_raw_data > 0)
-            .map(|section| {
-                let start = pe.image_base + u64::from(section.virtual_address);
-                let mem_size = u64::from(section.virtual_size.max(section.size_of_raw_data));
+            .filter_map(|section| {
+                let start = pe
+                    .image_base
+                    .checked_add(u64::from(section.virtual_address))?;
+                // The section is `VirtualSize` bytes in memory; raw data past
+                // it is file-alignment padding the loader does not map. A
+                // `VirtualSize` of 0 (old linkers) means the raw size.
+                let mem_size = u64::from(match section.virtual_size {
+                    0 => section.size_of_raw_data,
+                    v => v,
+                });
+                // A section that would run past the top of the address space
+                // is not mapped.
+                start.checked_add(mem_size)?;
                 let offset = section.pointer_to_raw_data as usize;
-                let filesz = section.size_of_raw_data as usize;
+                let filesz = section.size_of_raw_data.min(mem_size as u32) as usize;
                 let data = file_bytes
                     .get(offset..offset.saturating_add(filesz))
                     .unwrap_or(&[])
                     .to_vec();
-                PeSection {
+                Some(PeSection {
                     name: section
                         .real_name
                         .clone()
@@ -187,7 +198,7 @@ impl PeBinary {
                     data,
                     writable: section.characteristics & IMAGE_SCN_MEM_WRITE != 0,
                     executable: section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
-                }
+                })
             })
             .filter(|s| s.mem_size > 0)
             .collect::<Vec<_>>();
@@ -198,20 +209,19 @@ impl PeBinary {
         sections.sort_by_key(|s| s.start);
         let load_address = sections[0].start;
 
-        let entrypoint = pe.image_base + u64::from(pe.entry);
+        let entrypoint = pe.image_base.wrapping_add(u64::from(pe.entry));
         let mut known_functions = Vec::new();
         collect_coff_function_symbols(&pe, file_bytes, &mut known_functions);
         let imports: Vec<_> = pe
             .imports
             .iter()
-            .map(|import| {
-                let name = import.name.to_string();
-                PeImportSymbol {
-                    iat_address: pe.image_base + import.offset as u64,
-                    name,
+            .filter_map(|import| {
+                Some(PeImportSymbol {
+                    iat_address: pe.image_base.checked_add(import.offset as u64)?,
+                    name: import.name.to_string(),
                     dll: import.dll.to_string(),
                     ordinal: (import.ordinal != 0).then_some(import.ordinal),
-                }
+                })
             })
             .collect();
         mark_import_thunks(&mut known_functions, &sections, &imports, pe.is_64);
@@ -282,7 +292,9 @@ fn collect_exception_function_symbols(
             continue;
         }
 
-        let address = pe.image_base + u64::from(function.begin_address);
+        let Some(address) = pe.image_base.checked_add(u64::from(function.begin_address)) else {
+            continue;
+        };
         if !sections.iter().any(|section| section.contains(address)) {
             continue;
         }
@@ -302,6 +314,8 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
         return;
     };
     let strings = pe.header.coff_header.strings(file_bytes).ok().flatten();
+    // Only i386 decorates C names with a leading underscore.
+    let decorated = pe.header.coff_header.machine == COFF_MACHINE_X86;
 
     for (_index, inline_name, symbol) in symbols.iter() {
         if !symbol.is_function_definition() {
@@ -314,7 +328,17 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
         let Some(name) = symbol_name(&symbol, inline_name, strings.as_ref()) else {
             continue;
         };
-        let address = pe.image_base + u64::from(section.virtual_address) + u64::from(symbol.value);
+        let name = if decorated {
+            undecorate(name)
+        } else {
+            name.to_owned()
+        };
+        let Some(address) = pe
+            .image_base
+            .checked_add(u64::from(section.virtual_address) + u64::from(symbol.value))
+        else {
+            continue;
+        };
         out.push(PeFunctionSymbol {
             address,
             name: Some(name),
@@ -325,22 +349,24 @@ fn collect_coff_function_symbols(pe: &PE<'_>, file_bytes: &[u8], out: &mut Vec<P
     }
 }
 
-fn symbol_name(
-    symbol: &CoffSymbol,
-    inline_name: Option<&str>,
-    strings: Option<&goblin::strtab::Strtab<'_>>,
-) -> Option<String> {
+fn symbol_name<'a>(
+    symbol: &'a CoffSymbol,
+    inline_name: Option<&'a str>,
+    strings: Option<&goblin::strtab::Strtab<'a>>,
+) -> Option<&'a str> {
     if let Some(name) = inline_name
         && !name.is_empty()
     {
-        return Some(normalize_coff_name(name));
+        return Some(name);
     }
 
-    if let Some(strings) = strings
-        && let Ok(name) = symbol.name(strings)
-        && !name.is_empty()
-    {
-        return Some(normalize_coff_name(name));
+    // A long name (first byte 0) is a string-table offset in the last four
+    // name bytes, counted from the table's length field. Read here rather than
+    // through `Symbol::name`, which subtracts that field's size unchecked.
+    if symbol.name[0] == 0 {
+        let offset = u32::from_le_bytes(symbol.name[4..].try_into().ok()?);
+        let name = strings?.get_at(offset.checked_sub(4)? as usize)?;
+        return (!name.is_empty()).then_some(name);
     }
 
     let end = symbol
@@ -349,10 +375,11 @@ fn symbol_name(
         .position(|&b| b == 0)
         .unwrap_or(symbol.name.len());
     let name = std::str::from_utf8(&symbol.name[..end]).ok()?;
-    (!name.is_empty()).then(|| normalize_coff_name(name))
+    (!name.is_empty()).then_some(name)
 }
 
-fn normalize_coff_name(name: &str) -> String {
+/// An i386 C name without the underscore the compiler prefixes it with.
+fn undecorate(name: &str) -> String {
     name.strip_prefix('_').unwrap_or(name).to_string()
 }
 
@@ -392,7 +419,7 @@ fn import_thunk_iat(sections: &[PeSection], address: u64, is_64: bool) -> Option
     let operand = [bytes[2], bytes[3], bytes[4], bytes[5]];
     if is_64 {
         let disp = i32::from_le_bytes(operand) as i64;
-        Some((address as i64 + 6 + disp) as u64)
+        Some(address.wrapping_add(6).wrapping_add_signed(disp))
     } else {
         Some(u32::from_le_bytes(operand) as u64)
     }
@@ -507,11 +534,11 @@ impl BinaryFormat for PeBinary {
     }
 
     fn mapped_regions(&self) -> Vec<(u64, Vec<u8>, bool, bool)> {
+        let mut budget = crate::ZERO_FILL_LIMIT;
         self.sections
             .iter()
             .map(|sec| {
-                let mut bytes = sec.data.clone();
-                bytes.resize(sec.mem_size as usize, 0);
+                let bytes = crate::zero_filled(&sec.data, sec.mem_size, &mut budget);
                 // Both flags are the section table's own, so a snapshot built
                 // from these regions answers `is_executable` and
                 // `is_known_read_only` exactly as the live binary does.
@@ -707,6 +734,85 @@ mod tests {
         b
     }
 
+    /// A minimal PE32 (`is_64 == false`, i386) or PE32+ (x86-64) at image base 0x400000 with one
+    /// `.text` section (VirtualSize 0x10, a 0x200-byte raw block at file offset 0x200, mapped at
+    /// 0x401000) whose first bytes are `jmp [0x401000]`, and a COFF symbol table naming `names`
+    /// as functions at `.text` + 0, + 4, …. Inline names only: each is at most eight bytes.
+    pub(crate) fn pe_image(is_64: bool, names: &[&str]) -> Vec<u8> {
+        const PE_OFF: usize = 0x40;
+        const OPT_OFF: usize = PE_OFF + 4 + 20;
+        const HEADERS: usize = 0x200;
+        const TEXT_RAW: usize = 0x200;
+        let opt_size: usize = if is_64 { 240 } else { 224 };
+        let sec_off = OPT_OFF + opt_size;
+        let symtab = HEADERS + TEXT_RAW;
+
+        let mut b = vec![0u8; symtab + 18 * names.len() + 4];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&(PE_OFF as u32).to_le_bytes());
+        b[PE_OFF..PE_OFF + 4].copy_from_slice(b"PE\0\0");
+        let w16 =
+            |b: &mut Vec<u8>, off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 =
+            |b: &mut Vec<u8>, off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+
+        let coff = PE_OFF + 4;
+        let machine = if is_64 {
+            COFF_MACHINE_X86_64
+        } else {
+            COFF_MACHINE_X86
+        };
+        w16(&mut b, coff, machine);
+        w16(&mut b, coff + 2, 1); // NumberOfSections
+        w32(&mut b, coff + 8, symtab as u32); // PointerToSymbolTable
+        w32(&mut b, coff + 12, names.len() as u32); // NumberOfSymbols
+        w16(&mut b, coff + 16, opt_size as u16);
+        w16(&mut b, coff + 18, 0x0102);
+
+        w16(&mut b, OPT_OFF, if is_64 { 0x20b } else { 0x10b });
+        w32(&mut b, OPT_OFF + 16, 0x1000); // AddressOfEntryPoint
+        w32(&mut b, OPT_OFF + 20, 0x1000); // BaseOfCode
+        if is_64 {
+            b[OPT_OFF + 24..OPT_OFF + 32].copy_from_slice(&0x40_0000u64.to_le_bytes());
+        } else {
+            w32(&mut b, OPT_OFF + 28, 0x40_0000);
+        }
+        w32(&mut b, OPT_OFF + 32, 0x1000); // SectionAlignment
+        w32(&mut b, OPT_OFF + 36, 0x200); // FileAlignment
+        w32(&mut b, OPT_OFF + 56, 0x2000); // SizeOfImage
+        w32(&mut b, OPT_OFF + 60, HEADERS as u32); // SizeOfHeaders
+        w16(&mut b, OPT_OFF + 68, 3); // Subsystem = console
+        w32(&mut b, OPT_OFF + if is_64 { 108 } else { 92 }, 16); // NumberOfRvaAndSizes
+
+        b[sec_off..sec_off + 5].copy_from_slice(b".text");
+        w32(&mut b, sec_off + 8, 0x10); // VirtualSize
+        w32(&mut b, sec_off + 12, 0x1000); // VirtualAddress
+        w32(&mut b, sec_off + 16, TEXT_RAW as u32); // SizeOfRawData
+        w32(&mut b, sec_off + 20, HEADERS as u32); // PointerToRawData
+        w32(&mut b, sec_off + 36, 0x6000_0020); // code, execute, read
+
+        // `jmp [0x401000]`: an absolute slot on i386, rip-relative on x86-64.
+        let operand = if is_64 {
+            (0x1000i32 - 6) as u32
+        } else {
+            0x40_1000
+        };
+        b[HEADERS..HEADERS + 2].copy_from_slice(&[0xff, 0x25]);
+        w32(&mut b, HEADERS + 2, operand);
+
+        for (i, name) in names.iter().enumerate() {
+            let s = symtab + 18 * i;
+            b[s..s + name.len()].copy_from_slice(name.as_bytes());
+            w32(&mut b, s + 8, 4 * i as u32); // Value
+            w16(&mut b, s + 12, 1); // SectionNumber
+            w16(&mut b, s + 14, 0x20); // Type: function
+            b[s + 16] = 2; // StorageClass: external
+        }
+        let strings = symtab + 18 * names.len();
+        w32(&mut b, strings, 4); // an empty string table
+        b
+    }
+
     #[test]
     fn parses_an_image_whose_reloc_directory_has_no_raw_data() {
         let bytes = pe32_with_unbacked_reloc_directory();
@@ -731,6 +837,106 @@ mod tests {
                 .iter()
                 .any(|s| s.start == 0x0040_2000 && s.data.is_empty())
         );
+    }
+
+    /// Everything `parse` computes, and the queries that read its tables.
+    fn exercise(bytes: &[u8]) {
+        if let Ok(pe) = PeBinary::parse(bytes) {
+            let _ = pe.entry_points();
+            let _ = pe.symbols();
+            let _ = pe.sections();
+            let _ = pe.segment_bounds(pe.load_address);
+            let _ = pe.is_executable(pe.analysis.entrypoint);
+        }
+    }
+
+    #[test]
+    fn an_image_base_at_the_top_of_the_address_space_does_not_overflow() {
+        let mut b = pe_image(true, &["main"]);
+        let image_base = 0x40 + 4 + 20 + 24;
+        b[image_base..image_base + 8].copy_from_slice(&(u64::MAX - 0xfff).to_le_bytes());
+        exercise(&b);
+    }
+
+    #[test]
+    fn mapped_regions_materialize_at_most_the_zero_fill_budget() {
+        let mut b = pe_image(true, &[]);
+        let virtual_size = 0x40 + 4 + 20 + 240 + 8;
+        b[virtual_size..virtual_size + 4].copy_from_slice(&0xffff_0000u32.to_le_bytes());
+        let pe = PeBinary::parse(&b).unwrap();
+        let regions = pe.mapped_regions();
+        assert_eq!(regions.len(), 1);
+        let file_backed = pe.sections[0].data.len();
+        assert!(regions[0].1.len() - file_backed <= crate::ZERO_FILL_LIMIT as usize);
+        assert_eq!(regions[0].1[..2], [0xff, 0x25]);
+    }
+
+    #[test]
+    fn a_section_is_its_virtual_size_in_memory() {
+        // `.text`: VirtualSize 0x10 of a 0x200-byte raw block.
+        let pe = PeBinary::parse(&pe_image(true, &[])).unwrap();
+        assert_eq!(pe.sections()[0].size, 0x10);
+        assert_eq!(pe.segment_bounds(0x40_1000), Some((0x40_1000, 0x40_1010)));
+        assert!(pe.is_executable(0x40_100f));
+        assert!(!pe.is_executable(0x40_1010), "file alignment padding");
+        assert_eq!(pe.byte_at(0x40_1010), None);
+        assert_eq!(pe.mapped_regions()[0].1.len(), 0x10);
+        // A VirtualSize of 0 stands for the raw size.
+        let mut b = pe_image(true, &[]);
+        let virtual_size = 0x40 + 4 + 20 + 240 + 8;
+        b[virtual_size..virtual_size + 4].fill(0);
+        let pe = PeBinary::parse(&b).unwrap();
+        assert_eq!(pe.sections()[0].size, 0x200);
+    }
+
+    #[test]
+    fn only_i386_names_lose_a_leading_underscore() {
+        // i386 cdecl decorates `main` as `_main`.
+        let pe = PeBinary::parse(&pe_image(false, &["_main", "_helper"])).unwrap();
+        assert_eq!(pe.symbol_address("main"), Some(0x40_1000));
+        assert_eq!(pe.symbol_address("helper"), Some(0x40_1004));
+        // x86-64 does not decorate: `_guard` is the name itself, as is
+        // `__chkstk`'s second underscore.
+        let pe = PeBinary::parse(&pe_image(true, &["main", "_guard", "__chk"])).unwrap();
+        assert_eq!(pe.symbol_address("main"), Some(0x40_1000));
+        assert_eq!(pe.symbol_address("_guard"), Some(0x40_1004));
+        assert_eq!(pe.symbol_address("__chk"), Some(0x40_1008));
+        assert_eq!(pe.symbol_address("guard"), None);
+    }
+
+    #[test]
+    fn truncated_and_mutated_images_never_panic() {
+        for base in [
+            pe32_with_unbacked_reloc_directory(),
+            pe_image(false, &["_main", "_f"]),
+            pe_image(true, &["main", "f"]),
+        ] {
+            for len in (0..base.len()).step_by(8) {
+                exercise(&base[..len]);
+            }
+            // Only the headers and the symbol table carry values the parser
+            // computes with; the section's bytes are data.
+            let fields = (0..0x200).chain(0x400..base.len()).step_by(2);
+            for at in fields {
+                for v in [
+                    0u64,
+                    1,
+                    0x7fff_ffff,
+                    0x8000_0000,
+                    0xffff_ffff,
+                    u64::MAX - 0xfff,
+                ] {
+                    let mut b = base.clone();
+                    let n = 4.min(b.len() - at);
+                    b[at..at + n].copy_from_slice(&(v as u32).to_le_bytes()[..n]);
+                    exercise(&b);
+                    if at + 8 <= b.len() {
+                        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                        exercise(&b);
+                    }
+                }
+            }
+        }
     }
 
     /// A section-less image around `analysis`, indexed the way `parse` does it.

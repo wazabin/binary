@@ -30,6 +30,7 @@ const BSS: u64 = BASE + 0x2000;
 const STB_GLOBAL: u8 = 1;
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
+const STT_GNU_IFUNC: u8 = 10;
 
 struct Sym {
     name: &'static str,
@@ -364,4 +365,21 @@ fn load_detects_and_parses_the_container() {
     assert_eq!(binary.entrypoint(), Some(ENTRY));
     assert_eq!(binary.symbol_address("main"), Some(BASE + 0x1136));
     assert_eq!(binary.sections().len(), 2);
+}
+
+#[test]
+fn an_ifunc_resolver_is_a_known_function() {
+    // `STT_GNU_IFUNC`: the symbol's value is its resolver, code like any
+    // function's (glibc's `memcpy`, `strlen`, ...).
+    let elf = parse(
+        2,
+        &[Sym {
+            name: "memcpy",
+            kind: STT_GNU_IFUNC,
+            value: BASE + 0x1300,
+            size: 0x10,
+        }],
+    );
+    assert_eq!(elf.symbol_name(0x401300), Some("memcpy"));
+    assert_eq!(elf.symbol_address("memcpy"), Some(0x401300));
 }
