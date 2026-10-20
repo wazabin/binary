@@ -411,7 +411,11 @@ pub fn hdr_starts(mem: &Mem, hdr: u64, len: u64, ptr_size: usize) -> Option<Vec<
         mut cursor, table, ..
     } = read_hdr(mem, hdr, len, ptr_size)?;
     let (enc, n) = table?;
-    let mut starts = Vec::with_capacity(n.min(1 << 20) as usize);
+    // The count is the file's word: reserve no more entries than the bytes
+    // left in the header hold (two encoded values each).
+    let entry = 2 * enc_size(enc, ptr_size) as u64;
+    let room = cursor.b.len().saturating_sub(cursor.p) as u64 / entry;
+    let mut starts = Vec::with_capacity(n.min(room) as usize);
     for _ in 0..n {
         starts.push(cursor.encoded(enc)?);
         let _fde = cursor.encoded(enc)?;
