@@ -10,7 +10,7 @@
 //! Nothing here knows a language: the clauses of a landing pad are the action
 //! chain, entry by entry; a type-table entry is an address ([`Ptr`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::eh_frame::{Cursor, OMIT, enc_size, fdes_from_hdr};
 use crate::image::{Image, RelocKind, SymbolKind};
@@ -198,7 +198,11 @@ fn parse_raw(b: &[u8], at: u64, ptr_size: usize) -> Option<RawLsda<'_>> {
 /// The call sites of `raw` as they apply to the function at `func`, their
 /// pads and clauses resolved. `None` when an action chain or a type-table
 /// entry is unreadable.
-fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
+///
+/// Every site, clause and filter type read takes one unit of `budget` (see
+/// [`take`]); when
+/// it runs out the LSDA is `None` and `budget` is 0.
+fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64, budget: &mut usize) -> Option<Vec<Site>> {
     let img = rs.img;
     let ptr_size = if img.is_64() { 8 } else { 4 };
     let lp_start = raw.lp_start.unwrap_or(func);
@@ -240,41 +244,67 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
         }
         Some(out)
     };
+    // The clauses of the action chain at `a` (1-based), read once per LSDA:
+    // the call sites share chains. A chain ends at 0, at 256 records, or
+    // where it comes back to a record it has read (a cycle the unwinder would
+    // spin on).
+    let mut chains: HashMap<u64, Vec<Clause>> = HashMap::new();
+    let mut chain = |a: u64, budget: &mut usize| -> Option<Vec<Clause>> {
+        if let Some(c) = chains.get(&a) {
+            return Some(c.clone());
+        }
+        let mut clauses = Vec::new();
+        let mut p = usize::try_from(a - 1)
+            .ok()
+            .and_then(|a| raw.actions.checked_add(a))?;
+        let mut seen = HashSet::new();
+        for _ in 0..256 {
+            if !seen.insert(p) {
+                break;
+            }
+            let mut ac = Cursor::new(raw.b, raw.at);
+            ac.p = p;
+            let filter = ac.sleb()?;
+            let next_at = ac.p;
+            let next = ac.sleb()?;
+            let clause = if filter > 0 {
+                Clause::Catch {
+                    index: filter,
+                    ty: type_at(filter)?,
+                }
+            } else if filter == 0 {
+                Clause::Cleanup
+            } else {
+                Clause::Filter {
+                    index: filter,
+                    types: spec_at(filter)?,
+                }
+            };
+            let cost = 1 + match &clause {
+                Clause::Filter { types, .. } => types.len(),
+                _ => 0,
+            };
+            take(budget, cost)?;
+            clauses.push(clause);
+            if next == 0 {
+                break;
+            }
+            p = usize::try_from((next_at as i64).checked_add(next)?).ok()?;
+        }
+        chains.insert(a, clauses.clone());
+        Some(clauses)
+    };
     let mut sites = Vec::new();
     for &(s, l, lp, a) in &raw.cs {
+        take(budget, 1)?;
         let mut clauses = Vec::new();
         if lp != 0 {
             if a == 0 {
                 clauses.push(Clause::Cleanup);
             } else {
-                // `a` is 1-based.
-                let mut p = usize::try_from(a - 1)
-                    .ok()
-                    .and_then(|a| raw.actions.checked_add(a))?;
-                for _ in 0..256 {
-                    let mut ac = Cursor::new(raw.b, raw.at);
-                    ac.p = p;
-                    let filter = ac.sleb()?;
-                    let next_at = ac.p;
-                    let next = ac.sleb()?;
-                    if filter > 0 {
-                        clauses.push(Clause::Catch {
-                            index: filter,
-                            ty: type_at(filter)?,
-                        });
-                    } else if filter == 0 {
-                        clauses.push(Clause::Cleanup);
-                    } else {
-                        clauses.push(Clause::Filter {
-                            index: filter,
-                            types: spec_at(filter)?,
-                        });
-                    }
-                    if next == 0 {
-                        break;
-                    }
-                    p = usize::try_from((next_at as i64).checked_add(next)?).ok()?;
-                }
+                // A cached chain costs its length again: the copy is memory too.
+                clauses = chain(a, budget)?;
+                take(budget, clauses.len())?;
             }
         }
         sites.push(Site {
@@ -286,6 +316,26 @@ fn sites_of(rs: &Resolver, raw: &RawLsda, func: u64) -> Option<Vec<Site>> {
     }
     Some(sites)
 }
+
+/// Takes `n` units of `budget`, or empties it and is `None` when it has
+/// fewer.
+fn take(budget: &mut usize, n: usize) -> Option<()> {
+    match budget.checked_sub(n) {
+        Some(left) => {
+            *budget = left;
+            Some(())
+        }
+        None => {
+            *budget = 0;
+            None
+        }
+    }
+}
+
+/// How many sites, clauses and filter types [`parse`] reads from one image,
+/// at most: an LSDA's chains are shared by its sites and an LSDA by its
+/// FDEs, so a small file can name far more than it holds.
+const BUDGET: usize = 1 << 22;
 
 // --- the FDE-based reader -----------------------------------------------------------
 
@@ -306,8 +356,17 @@ pub(crate) fn parse(img: &Image) -> Eh {
     };
     let rs = Resolver::new(img);
     eh.fdes = fdes.len();
+    let mut budget = BUDGET;
+    // The (start, LSDA) pairs read, and the starts lifted: the header may
+    // list one FDE many times, and only the first lifted read of a start is
+    // kept.
+    let mut read = HashSet::new();
+    let mut lifted = HashSet::new();
     for f in &fdes {
         let Some(l) = f.lsda else { continue };
+        if lifted.contains(&f.start) {
+            continue;
+        }
         let lsda = if f.lsda_indirect {
             match img.read(l, ptr_size) {
                 Some(b) if ptr_size == 8 => u64::from_le_bytes(b.try_into().unwrap()),
@@ -317,22 +376,33 @@ pub(crate) fn parse(img: &Image) -> Eh {
         } else {
             l
         };
-        if lsda == 0 {
+        if lsda == 0 || !read.insert((f.start, lsda)) {
             continue;
         }
         let personality = f.cie.personality.and_then(|(enc, v)| rs.ptr(enc, v));
         let sites = img
             .bytes_from(lsda)
             .and_then(|b| parse_raw(b, lsda, ptr_size))
-            .and_then(|raw| sites_of(&rs, &raw, f.start));
+            .and_then(|raw| sites_of(&rs, &raw, f.start, &mut budget));
         match sites {
-            Some(sites) => eh.funcs.push(FuncEh {
-                start: f.start,
-                end: f.end,
-                personality,
-                sites,
-                lsda,
-            }),
+            Some(sites) => {
+                lifted.insert(f.start);
+                eh.funcs.push(FuncEh {
+                    start: f.start,
+                    end: f.end,
+                    personality,
+                    sites,
+                    lsda,
+                })
+            }
+            None if budget == 0 => {
+                eh.warnings.push(format!(
+                    "fde {:#x}: the exception tables name more than {BUDGET} call sites and clauses; \
+                     the rest not lifted",
+                    f.start
+                ));
+                break;
+            }
             None => eh
                 .warnings
                 .push(format!("fde {:#x}: LSDA at {lsda:#x} unreadable", f.start)),
