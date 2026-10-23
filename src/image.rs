@@ -416,7 +416,8 @@ pub struct Image<'a> {
     /// The allocated sections, in header order; empty when there are no
     /// section headers.
     pub sections: Vec<Section<'a>>,
-    /// Dynamic relocations: `DT_RELA`, then `DT_JMPREL`, then `DT_REL` (in
+    /// Dynamic relocations: `DT_RELA`, then `DT_JMPREL`, then `DT_REL`, then
+    /// `DT_RELR`'s, as RELATIVEs with the word in place as addend (in
     /// each table's order), then those of allocated relocation sections no
     /// dynamic tag covers.
     pub relocs: Vec<Reloc>,
@@ -722,6 +723,13 @@ impl<'a> Image<'a> {
                 plt_relocs = before..relocs.len();
             }
         }
+        // `DT_RELR` (packed RELATIVE relocations): each is a RELATIVE whose
+        // addend is the word in place, which is how it is read here.
+        if let (Some(a), Some(n)) = (tag(DT_RELR), tag(DT_RELRSZ))
+            && let Some(b) = img.read(a, n as usize)
+        {
+            img.read_relr(b, &mut relocs);
+        }
         // The dynamic relocations name `.dynsym` entries the hash tables may
         // not count (see `dynsym_entries`).
         let reloc_symbols = relocs.iter().map(|r| r.sym as usize + 1).max().unwrap_or(0);
@@ -1002,6 +1010,47 @@ impl<'a> Image<'a> {
                 sym,
                 addend,
             });
+        }
+    }
+
+    /// Decode a `DT_RELR` table (the gABI's packed relative relocations): an
+    /// even entry is the address of a word to relocate, and the next word
+    /// after it is where its bitmaps start; an odd entry is a bitmap whose bit
+    /// `i` (1 to word bits - 1) relocates the `i - 1`th word from there, and
+    /// moves it on by word bits - 1 words. Each location is a
+    /// [`RelocKind::Relative`] whose addend is the word the file holds there
+    /// (RELR's addend is implicit, in place); one whose word the file does not
+    /// hold is dropped, as are bitmaps before any address.
+    fn read_relr(&self, b: &[u8], out: &mut Vec<Reloc>) {
+        let fmt = self.fmt;
+        let w = fmt.word() as u64;
+        let mut next: Option<u64> = None;
+        let mut push = |at: u64| {
+            if let Some(v) = self.read(at, w as usize).and_then(|x| fmt.uword(x, 0)) {
+                // (an address: zero-extended, the word as the loader adds it)
+                out.push(Reloc {
+                    offset: at,
+                    kind: RelocKind::Relative,
+                    sym: 0,
+                    addend: v as i64,
+                });
+            }
+        };
+        for e in b.chunks_exact(w as usize) {
+            let Some(v) = fmt.uword(e, 0) else { break };
+            if v & 1 == 0 {
+                push(v);
+                next = v.checked_add(w);
+            } else if let Some(base) = next {
+                for i in 1..w * 8 {
+                    if v >> i & 1 != 0
+                        && let Some(at) = (i - 1).checked_mul(w).and_then(|o| base.checked_add(o))
+                    {
+                        push(at);
+                    }
+                }
+                next = (w * 8 - 1).checked_mul(w).and_then(|o| base.checked_add(o));
+            }
         }
     }
 
