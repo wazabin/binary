@@ -124,6 +124,43 @@ fn relocations_in_table_order_with_their_kinds() {
     );
 }
 
+/// `DT_RELR`: an address entry, then a bitmap (bits 1 and 3: the first and
+/// the third word after it) are three RELATIVEs whose addends are the words in
+/// place. Before, the table was not read at all, so a PIE's packed relative
+/// relocations (coreutils-9.10-5.fc44's code pointers in `.data.rel.ro`) were
+/// no relocations.
+#[test]
+fn relr_entries_are_relatives_with_the_word_in_place() {
+    let mut b = Buf(build(false));
+    // The two spare dynamic entries: DT_RELR at 0x3380, DT_RELRSZ 16.
+    b.u64(0x1000 + 16 * 19, 36);
+    b.u64(0x1000 + 16 * 19 + 8, 0x3380);
+    b.u64(0x1000 + 16 * 20, 35);
+    b.u64(0x1000 + 16 * 20 + 8, 16);
+    b.u64(0x1380, 0x3310);
+    b.u64(0x1388, 0b1011);
+    for (at, v) in [(0x1310, 0x700u64), (0x1318, 0x708), (0x1328, 0x710)] {
+        b.u64(at, v);
+    }
+    let img = Image::load(&b.0).unwrap();
+    let relr: Vec<_> = img
+        .relocs
+        .iter()
+        .filter(|r| r.offset >= 0x3310 && r.offset < 0x3380)
+        .map(|r| (r.offset, r.kind, r.sym, r.addend))
+        .collect();
+    assert_eq!(
+        relr,
+        [
+            (0x3310, RelocKind::Relative, 0, 0x700),
+            (0x3318, RelocKind::Relative, 0, 0x708),
+            (0x3328, RelocKind::Relative, 0, 0x710),
+        ]
+    );
+    assert!(img.reloc_at(0x3320).is_none());
+    assert_eq!(img.word(0x3328), Some(0x710));
+}
+
 #[test]
 fn words_apply_the_relocation_the_loader_would() {
     let bytes = build(false);
